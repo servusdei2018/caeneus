@@ -89,6 +89,26 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // --- Shared Library (C ABI) ---
+    // Produces libcaeneus.so / libcaeneus.dylib / caeneus.dll in zig-out/lib/.
+    // Root source is the C-ABI bridge; the core caeneus module is imported so
+    // ffi.zig can access Engine and related types without directly touching the
+    // internal shard/slab files.
+    const lib = b.addLibrary(.{
+        .name = "caeneus",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ffi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "caeneus", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(lib);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

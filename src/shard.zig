@@ -126,7 +126,7 @@ pub const Shard = struct {
         self.hashes[slot_idx] = 0;
     }
 
-    pub fn get(self: *Shard, key: []const u8, hash: u64, buf: []u8) !?[]const u8 {
+    pub fn get(self: *Shard, key: []const u8, hash: u64, buf: []u8, required_len: ?*usize) !?[]const u8 {
         // --- Optimistic lock-free
         var attempts: u32 = 0;
         while (attempts < 10) : (attempts += 1) {
@@ -153,7 +153,10 @@ pub const Shard = struct {
 
             if (buf.len < metadata.len) {
                 const seq2 = self.seq.load(.seq_cst);
-                if (seq1 == seq2) return error.BufferTooSmall;
+                if (seq1 == seq2) {
+                    if (required_len) |rl| rl.* = metadata.len;
+                    return error.BufferTooSmall;
+                }
                 continue;
             }
 
@@ -196,7 +199,10 @@ pub const Shard = struct {
 
         const header = self.slab.readHeader(metadata.offset);
         const val_len = metadata.len;
-        if (buf.len < val_len) return error.BufferTooSmall;
+        if (buf.len < val_len) {
+            if (required_len) |rl| rl.* = val_len;
+            return error.BufferTooSmall;
+        }
 
         const val_offset = metadata.offset + @sizeOf(BlockHeader) + header.key_len;
         @memcpy(buf[0..val_len], self.slab.buffer[val_offset..][0..val_len]);
@@ -216,9 +222,19 @@ pub const Shard = struct {
         const existing_slot = self.lookup(key, hash);
         if (existing_slot != invalid_slot_idx) {
             const new_offset = try self.slab.allocate(key, value, existing_slot);
+
+            const meta_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.metadata[existing_slot])), .acquire);
+            const metadata = @as(SlotMetadata, @bitCast(meta_u64));
+            const was_evicted = (metadata.offset == invalid_offset);
+
             const new_meta_u64 = @as(u64, @bitCast(SlotMetadata{ .offset = new_offset, .len = @intCast(value.len) }));
             @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.metadata[existing_slot])), new_meta_u64, .release);
             self.visited.setAtomic(existing_slot);
+
+            if (was_evicted) {
+                self.hashes[existing_slot] = hash;
+                self.insertIndexMap(hash, existing_slot);
+            }
             return;
         }
 

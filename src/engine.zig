@@ -57,7 +57,7 @@ pub const Engine = struct {
         self.allocator.free(self.shards);
     }
 
-    pub fn get(self: *Engine, key: []const u8, buf: []u8) !?[]const u8 {
+    pub fn get(self: *Engine, key: []const u8, buf: []u8, required_len: ?*usize) !?[]const u8 {
         const hash = common.hashKey(key);
         const shard_idx = hash & self.shard_mask;
         const shard = &self.shards[shard_idx];
@@ -67,7 +67,7 @@ pub const Engine = struct {
         const table_idx = @as(usize, hash_low) & shard.index_mask;
         @prefetch(&shard.table[table_idx], .{ .rw = .read, .locality = 3, .cache = .data });
 
-        return shard.get(key, hash, buf);
+        return shard.get(key, hash, buf, required_len);
     }
 
     pub fn set(self: *Engine, key: []const u8, value: []const u8) !void {
@@ -81,5 +81,24 @@ pub const Engine = struct {
         @prefetch(&shard.table[table_idx], .{ .rw = .read, .locality = 3, .cache = .data });
 
         try shard.set(key, value, hash);
+    }
+
+    /// Returns the exact byte length of the value stored under `key`, or null
+    /// if the key is not present. Used by FFI when the required_len out-param
+    /// from get() yields zero (e.g. key evicted between the seqlock validation
+    /// and the error return).
+    pub fn getRequiredLen(self: *Engine, key: []const u8) ?usize {
+        const hash = common.hashKey(key);
+        const shard_idx = hash & self.shard_mask;
+        const shard = &self.shards[shard_idx];
+
+        // A zero-length scratch buffer guarantees BufferTooSmall for any hit.
+        // shard.get() will populate `required` with the exact metadata.len.
+        var required: usize = 0;
+        _ = shard.get(key, hash, &[_]u8{}, &required) catch |err| {
+            if (err == error.BufferTooSmall) return if (required > 0) required else null;
+        };
+        // Cache miss.
+        return null;
     }
 };

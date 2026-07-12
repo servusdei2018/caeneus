@@ -275,7 +275,7 @@ fn benchmarkWorker(
 
         if (is_read) {
             gets += 1;
-            const res = engine.get(key, &read_buf) catch |err| {
+            const res = engine.get(key, &read_buf, null) catch |err| {
                 std.debug.print("Thread {} Get error: {}\n", .{ thread_id, err });
                 return;
             };
@@ -313,21 +313,21 @@ test "basic operations" {
 
     var read_buf: [128]u8 = undefined;
 
-    const missing = try engine.get("nonexistent", &read_buf);
+    const missing = try engine.get("nonexistent", &read_buf, null);
     try std.testing.expect(missing == null);
 
     try engine.set("hello", "world");
-    const got = try engine.get("hello", &read_buf);
+    const got = try engine.get("hello", &read_buf, null);
     try std.testing.expect(got != null);
     try std.testing.expectEqualSlices(u8, "world", got.?);
 
     try engine.set("hello", "antigravity");
-    const updated = try engine.get("hello", &read_buf);
+    const updated = try engine.get("hello", &read_buf, null);
     try std.testing.expect(updated != null);
     try std.testing.expectEqualSlices(u8, "antigravity", updated.?);
 
     try engine.set("hello", "low-latency");
-    const got_short = try engine.get("hello", &read_buf);
+    const got_short = try engine.get("hello", &read_buf, null);
     try std.testing.expect(got_short != null);
     try std.testing.expectEqualSlices(u8, "low-latency", got_short.?);
 }
@@ -346,28 +346,28 @@ test "eviction correctness" {
     try engine.set("item_4", "val_4");
     try engine.set("item_5", "val_5");
 
-    _ = try engine.get("item_0", &read_buf);
-    _ = try engine.get("item_1", &read_buf);
+    _ = try engine.get("item_0", &read_buf, null);
+    _ = try engine.get("item_1", &read_buf, null);
 
     try engine.set("item_6", "val_6");
 
-    const got_item_0 = try engine.get("item_0", &read_buf);
+    const got_item_0 = try engine.get("item_0", &read_buf, null);
     try std.testing.expect(got_item_0 != null);
     try std.testing.expectEqualSlices(u8, "val_0", got_item_0.?);
 
-    const got_item_6 = try engine.get("item_6", &read_buf);
+    const got_item_6 = try engine.get("item_6", &read_buf, null);
     try std.testing.expect(got_item_6 != null);
     try std.testing.expectEqualSlices(u8, "val_6", got_item_6.?);
 
     try engine.set("item_7", "val_7");
 
-    const got_item_1 = try engine.get("item_1", &read_buf);
+    const got_item_1 = try engine.get("item_1", &read_buf, null);
     try std.testing.expect(got_item_1 != null);
     try std.testing.expectEqualSlices(u8, "val_1", got_item_1.?);
 
     try engine.set("item_8", "val_8");
 
-    const got_item_2 = try engine.get("item_2", &read_buf);
+    const got_item_2 = try engine.get("item_2", &read_buf, null);
     try std.testing.expect(got_item_2 == null);
 }
 
@@ -403,7 +403,7 @@ fn benchmarkWorkerSimple(engine: *Engine, thread_id: usize, ops_count: usize) vo
         const val_len = rand.intRangeAtMost(usize, 10, 60);
         const val = val_buf[0..val_len];
         engine.set(key, val) catch return;
-        _ = engine.get(key, &read_buf) catch return;
+        _ = engine.get(key, &read_buf, null) catch return;
     }
 }
 
@@ -461,7 +461,7 @@ test "zero post-initialization allocations" {
     while (i < 1000) : (i += 1) {
         const key = try std.fmt.bufPrint(&key_buf, "key_{}", .{i});
         try engine.set(key, &val_buf);
-        _ = try engine.get(key, &read_buf);
+        _ = try engine.get(key, &read_buf, null);
     }
 
     try std.testing.expectEqual(@as(usize, 0), tracker.alloc_count);
