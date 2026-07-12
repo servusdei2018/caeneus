@@ -1,0 +1,52 @@
+{
+  "name": "caeneus-native",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "prebuilds/",
+    "binding.cpp",
+    "binding.gyp",
+    "scripts/",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "lru-cache": "^11.5.2",
+    "node-cache": "^5.1.2",
+    "node-gyp": "^11.0.0",
+    "typescript": "^5.0.0"
+  },
+  "description": "Node.js and TypeScript native bindings for Caeneus",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/servusdei2018/caeneus.git",
+    "directory": "ext/node"
+  },
+  "homepage": "https://github.com/servusdei2018/caeneus",
+  "bugs": {
+    "url": "https://github.com/servusdei2018/caeneus/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "install": "node scripts/install.js",
+    "build:native": "node-gyp rebuild",
+    "build:native:fast": "node-gyp rebuild --caeneus_fast_api=1 --caeneus_target_name=caeneus_fast",
+    "build:js": "tsc",
+    "build:prebuild": "node scripts/build-prebuild.js",
+    "build": "npm run build:native && tsc",
+    "test": "npm run build && node --test dist/test/smoke.js",
+    "benchmark": "npm run build && node dist/benchmark.js"
+  }
+}

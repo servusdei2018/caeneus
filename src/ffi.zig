@@ -1,15 +1,16 @@
 //! C-ABI bridge.
 //!
 //! Exposes entry points that can be called from any C-compatible host runtime
-//! (C, Python/ctypes, Go/cgo, Rust/bindgen, JNI…).
+//! (C, compiled CPython/Node extensions, Go/cgo, Rust/bindgen, JNI…).
 //!
-//! Errors are returned as explicit c_int codes:
+//! caeneus_get returns a packed u64: the signed c_int status occupies the
+//! high 32 bits and the value length occupies the low 32 bits.
 //!
 //!   0  CAENEUS_OK           — Operation succeeded.
-//!  -1  CAENEUS_MISS         — Key not present in the cache.
-//!  -2  CAENEUS_ERR_SMALL_BUF — Destination buffer too small; *out_val_len
-//!                              contains the exact number of bytes required.
-//!  -3  CAENEUS_ERR_PANIC    — Unexpected internal error or allocation failure.
+//! -1  CAENEUS_MISS           — Key not present in the cache.
+//! -2  CAENEUS_ERR_SMALL_BUF  — Destination buffer too small; the low 32 bits
+//!                              contain the exact number of bytes required.
+//! -3  CAENEUS_ERR_PANIC      — Unexpected internal error or allocation failure.
 
 const std = @import("std");
 const caeneus = @import("caeneus");
@@ -23,6 +24,12 @@ const CAENEUS_OK: c_int = 0;
 const CAENEUS_MISS: c_int = -1;
 const CAENEUS_ERR_SMALL_BUF: c_int = -2;
 const CAENEUS_ERR_PANIC: c_int = -3;
+
+fn packResult(code: c_int, length: usize) u64 {
+    const code_bits: u32 = @bitCast(code);
+    const length_bits: u32 = @intCast(length);
+    return (@as(u64, code_bits) << 32) | @as(u64, length_bits);
+}
 
 // ---------------------------------------------------------------------------
 // Internal wrapper
@@ -104,25 +111,25 @@ pub export fn caeneus_set(
 //
 // On a successful hit:
 //   - The value bytes are written to buf_ptr.
-//   - *out_val_len is set to the number of bytes written.
-//   - Returns CAENEUS_OK.
+//   - The low 32 bits contain the number of bytes written.
+//   - Returns a packed CAENEUS_OK result.
 //
 // On a buffer-too-small hit:
 //   - No value bytes are copied.
-//   - *out_val_len is set to the exact number of bytes required.
-//   - Returns CAENEUS_ERR_SMALL_BUF.
+//   - The low 32 bits contain the exact number of bytes required.
+//   - Returns a packed CAENEUS_ERR_SMALL_BUF result.
 //   The caller should resize buf and retry.
 //
 //   Passing buf_len == 0 is a valid "probe-only" call: the engine will always
-//   report CAENEUS_ERR_SMALL_BUF and populate *out_val_len with the required
-//   size, allowing callers to allocate the right buffer before a second call.
+//   report CAENEUS_ERR_SMALL_BUF and pack the required size in the result,
+//   allowing callers to allocate the right buffer before a second call.
 //
 // On a cache miss:
-//   - *out_val_len is unmodified.
-//   - Returns CAENEUS_MISS.
+//   - The low 32 bits are zero.
+//   - Returns a packed CAENEUS_MISS result.
 //
 // On any unexpected error:
-//   - Returns CAENEUS_ERR_PANIC.
+//   - Returns a packed CAENEUS_ERR_PANIC result.
 // ---------------------------------------------------------------------------
 
 pub export fn caeneus_get(
@@ -131,34 +138,28 @@ pub export fn caeneus_get(
     key_len: usize,
     buf_ptr: [*]u8,
     buf_len: usize,
-    out_val_len: *usize,
-) c_int {
-    const wrapper: *EngineWrapper = @ptrCast(@alignCast(handle orelse return CAENEUS_ERR_PANIC));
+) u64 {
+    const wrapper: *EngineWrapper = @ptrCast(@alignCast(handle orelse return packResult(CAENEUS_ERR_PANIC, 0)));
     const key = key_ptr[0..key_len];
     const buf = buf_ptr[0..buf_len];
 
-    // Pass out_val_len directly into engine.get().
-    // On a successful hit the returned slice length is written below.
-    // On error.BufferTooSmall, shard.get() writes metadata.len to
-    // out_val_len before returning the error.
-    const result = wrapper.engine.get(key, buf, out_val_len) catch |err| blk: {
+    var required_len: usize = 0;
+    const result = wrapper.engine.get(key, buf, &required_len) catch |err| blk: {
         if (err == error.BufferTooSmall) {
-            // out_val_len was already populated by shard.get().
             // Otherwise: if the key was evicted between the seqlock
-            // validation and the error return, out_val_len may still be 0.
+            // validation and the error return, required_len may still be 0.
             // In which case, getRequiredLen() performs a fresh shard lookup.
-            if (out_val_len.* == 0) {
-                out_val_len.* = wrapper.engine.getRequiredLen(key) orelse 0;
+            if (required_len == 0) {
+                required_len = wrapper.engine.getRequiredLen(key) orelse 0;
             }
-            return CAENEUS_ERR_SMALL_BUF;
+            return packResult(CAENEUS_ERR_SMALL_BUF, required_len);
         }
         break :blk null;
     };
 
     if (result) |slice| {
-        out_val_len.* = slice.len;
-        return CAENEUS_OK;
+        return packResult(CAENEUS_OK, slice.len);
     }
 
-    return CAENEUS_MISS;
+    return packResult(CAENEUS_MISS, 0);
 }

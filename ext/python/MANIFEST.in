@@ -1,0 +1,3 @@
+include README.md
+include caeneusmodule.c
+include build_native.py

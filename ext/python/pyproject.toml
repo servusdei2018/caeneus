@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = true
+
+[project]
+name = "caeneus-native"
+version = "0.1.0"
+description = "Compiled CPython extension for the Caeneus cache engine"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "The Caeneus Authors" },
+]
+keywords = ["cache", "native", "zig"]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: C",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/servusdei2018/caeneus"
+Repository = "https://github.com/servusdei2018/caeneus"
+Issues = "https://github.com/servusdei2018/caeneus/issues"
+
+[project.optional-dependencies]
+benchmarks = [
+    "cachetools>=6.2.6",
+    "lru-dict>=1.4.1",
+]

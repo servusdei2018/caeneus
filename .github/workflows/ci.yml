@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - run: go -C ext/go test ./cmd/caeneus-native/
+
+      - name: Test Go bindings
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          eval "$(go -C ext/go run ./cmd/caeneus-native --local --dest "${RUNNER_TEMP}/caeneus/local")"
+          go -C ext/go test ./...
+
+  python:
+    name: Test Python binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Python tooling
+        run: python -m pip install --upgrade pip uv
+
+      - name: Build the local native archive
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Test the checkout binding
+        env:
+          CAENEUS_ROOT: ${{ github.workspace }}
+        run: |
+          uv venv "${RUNNER_TEMP}/caeneus-python-venv"
+          uv pip install --python "${RUNNER_TEMP}/caeneus-python-venv/bin/python" ext/python
+          "${RUNNER_TEMP}/caeneus-python-venv/bin/python" ext/python/test_caeneus.py
+
+      - name: Test install from outside the checkout
+        env:
+          CAENEUS_ROOT: ${{ github.workspace }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/caeneus-python-consumer"
+          cd "${RUNNER_TEMP}/caeneus-python-consumer"
+          "${RUNNER_TEMP}/caeneus-python-venv/bin/python" -c \
+            "import caeneus; c = caeneus.Cache(); c.set('ci', 'ok'); assert c.get('ci') == b'ok'; c.close()"
+
+  node:
+    name: Test Node and Bun binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "latest"
+
+      - name: Build the local native archive
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Build and test the checkout binding
+        working-directory: ext/node
+        run: |
+          npm install
+          npm test
+          npm run build:prebuild -- linux-x64
+
+      - name: Test the packed npm package with npm
+        working-directory: ext/node
+        run: |
+          npm run build:js
+          mkdir -p "${RUNNER_TEMP}/caeneus-node-package"
+          npm pack --pack-destination "${RUNNER_TEMP}/caeneus-node-package"
+          package_tarball=$(printf '%s\n' "${RUNNER_TEMP}"/caeneus-node-package/*.tgz)
+          mkdir -p "${RUNNER_TEMP}/caeneus-node-consumer"
+          cd "${RUNNER_TEMP}/caeneus-node-consumer"
+          npm init -y
+          npm install "$package_tarball"
+          node -e "const {Cache}=require('caeneus-native'); const c=new Cache(); c.set('ci','ok'); if (!c.get('ci').equals(Buffer.from('ok'))) process.exit(1); c.close()"
+
+      - name: Test the packed npm package with Bun
+        working-directory: ext/node
+        run: |
+          package_tarball=$(printf '%s\n' "${RUNNER_TEMP}"/caeneus-node-package/*.tgz)
+          mkdir -p "${RUNNER_TEMP}/caeneus-bun-consumer"
+          cd "${RUNNER_TEMP}/caeneus-bun-consumer"
+          bun init -y
+          bun add "$package_tarball"
+          bun -e "const {Cache}=require('caeneus-native'); const c=new Cache(); c.set('ci','ok'); if (!c.get('ci').equals(Buffer.from('ok'))) process.exit(1); c.close()"

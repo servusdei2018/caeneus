@@ -87,14 +87,39 @@ pub fn build(b: *std.Build) void {
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
-    b.installArtifact(exe);
+    //
+    // The benchmark CLI uses POSIX timing APIs and is not installed on Windows.
+    if (target.result.os.tag != .windows) {
+        b.installArtifact(exe);
+    }
 
-    // --- Shared Library (C ABI) ---
-    // Produces libcaeneus.so / libcaeneus.dylib / caeneus.dll in zig-out/lib/.
-    // Root source is the C-ABI bridge; the core caeneus module is imported so
-    // ffi.zig can access Engine and related types without directly touching the
-    // internal shard/slab files.
-    const lib = b.addLibrary(.{
+    // --- Static Library (C ABI) for static FFI consumers ---
+    // Produces libcaeneus.a / caeneus-static.lib in zig-out/lib/.
+    const static_lib_name: []const u8 = if (target.result.os.tag == .windows)
+        "caeneus-static"
+    else
+        "caeneus";
+    const static_lib = b.addLibrary(.{
+        .name = static_lib_name,
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ffi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "caeneus", .module = mod },
+            },
+        }),
+    });
+    static_lib.bundle_compiler_rt = true;
+    b.installArtifact(static_lib);
+
+    // Dynamic Library (C ABI) for native extension consumers that prefer
+    // runtime linking. The static archive remains the portable default for
+    // Go, Python, and Node builds, while this target makes `libcaeneus.so`
+    // / `libcaeneus.dylib` available from the same Zig build graph.
+    const dynamic_lib = b.addLibrary(.{
         .name = "caeneus",
         .linkage = .dynamic,
         .root_module = b.createModule(.{
@@ -107,7 +132,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(lib);
+    b.installArtifact(dynamic_lib);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).

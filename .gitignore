@@ -10,9 +10,22 @@
 # -andrewrk
 
 .zig-cache/
+.zig-global-cache/
 zig-out/
+/prebuilt/
 /release/
 /debug/
 /build/
 /build-*/
 /docgen_tmp/
+
+# Native language-extension build outputs.
+ext/python/.venv/
+ext/python/build/
+ext/python/*.egg-info/
+ext/python/*.so
+__pycache__/
+ext/node/build/
+ext/node/dist/
+ext/node/prebuilds/
+ext/node/node_modules/

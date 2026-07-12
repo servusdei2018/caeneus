@@ -77,7 +77,22 @@ fn nextPowerLaw(random: std.Random, n: usize, skew_power: usize) usize {
     return val % n;
 }
 
-pub fn main() !void {
+fn isQuickMode(args: std.process.Args) bool {
+    var iterator = std.process.Args.Iterator.init(args);
+    defer iterator.deinit();
+
+    _ = iterator.next();
+    while (iterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--quick")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    const quick = isQuickMode(init.args);
+
     std.debug.print("==================================================\n", .{});
     std.debug.print("   Caeneus Benchmark\n", .{});
     std.debug.print("==================================================\n\n", .{});
@@ -85,16 +100,17 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     // --- BENCHMARK CONFIGURATION ---
-    const num_threads = 4;
-    const ops_per_thread = 200_000;
+    const num_threads: usize = if (quick) 1 else 4;
+    const ops_per_thread: usize = if (quick) 10_000 else 200_000;
     const read_ratio = 0.95; // 95% reads, 5% writes (skewed read-heavy cache workload)
-    const num_keys = 150_000; // Key cardinality
+    const num_keys: usize = if (quick) 4_096 else 150_000; // Key cardinality
     const skew_power = 3; // Power-law exponent for skewing access frequency
-    const num_shards = 64;
-    const slots_per_shard = 2048;
-    const slab_size_per_shard = 2 * 1024 * 1024; // 2MB slab per shard
+    const num_shards: u32 = if (quick) 4 else 64;
+    const slots_per_shard: u32 = if (quick) 128 else 2048;
+    const slab_size_per_shard: usize = if (quick) 64 * 1024 else 2 * 1024 * 1024;
 
     std.debug.print("Workload Profile:\n", .{});
+    std.debug.print("  Mode:                {s}\n", .{if (quick) "quick" else "full"});
     std.debug.print("  Threads:             {}\n", .{num_threads});
     std.debug.print("  Ops per Thread:      {}\n", .{ops_per_thread});
     std.debug.print("  Read Ratio:          {d:.0}%\n", .{read_ratio * 100.0});
@@ -108,7 +124,7 @@ pub fn main() !void {
     std.debug.print("--------------------------------------------------\n\n", .{});
 
     std.debug.print("Running Benchmarks...\n", .{});
-    const result = try runEngineBenchmark(Engine, allocator, num_threads, ops_per_thread, read_ratio, num_keys, skew_power, num_shards, slots_per_shard, slab_size_per_shard);
+    const result = try runEngineBenchmark(Engine, allocator, quick, num_threads, ops_per_thread, read_ratio, num_keys, skew_power, num_shards, slots_per_shard, slab_size_per_shard);
 
     std.debug.print("==================================================\n", .{});
     std.debug.print("               PERFORMANCE METRICS                \n", .{});
@@ -134,6 +150,7 @@ const BenchResult = struct {
 fn runEngineBenchmark(
     comptime EngineType: type,
     allocator: std.mem.Allocator,
+    quick: bool,
     num_threads: usize,
     ops_per_thread: usize,
     read_ratio: f64,
@@ -162,7 +179,7 @@ fn runEngineBenchmark(
         }
     }
 
-    const sample_size = 10_000;
+    const sample_size: usize = if (quick) 500 else 10_000;
     var threads = try allocator.alloc(std.Thread, num_threads);
     defer allocator.free(threads);
 

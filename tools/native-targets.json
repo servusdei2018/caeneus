@@ -1,0 +1,45 @@
+{
+  "version": "0.1.0",
+  "targets": [
+    {
+      "release_platform": "linux_amd64",
+      "os": "linux",
+      "architectures": ["x86_64", "amd64"],
+      "zig_target": "x86_64-linux-gnu",
+      "binding_release_platform": "linux_amd64",
+      "static_library": "libcaeneus.a",
+      "node_prebuild": "linux-x64",
+      "python_arch": "x86_64"
+    },
+    {
+      "release_platform": "linux_arm64",
+      "os": "linux",
+      "architectures": ["aarch64", "arm64"],
+      "zig_target": "aarch64-linux-gnu",
+      "binding_release_platform": "linux_arm64",
+      "static_library": "libcaeneus.a",
+      "node_prebuild": "linux-arm64",
+      "python_arch": "aarch64"
+    },
+    {
+      "release_platform": "darwin_arm64",
+      "os": "darwin",
+      "architectures": ["arm64", "aarch64"],
+      "zig_target": "aarch64-macos",
+      "binding_release_platform": "darwin_arm64",
+      "static_library": "libcaeneus.a",
+      "node_prebuild": "darwin-arm64",
+      "python_arch": "arm64"
+    },
+    {
+      "release_platform": "windows_amd64",
+      "os": "windows",
+      "architectures": ["amd64", "x86_64"],
+      "zig_target": "x86_64-windows-gnu",
+      "binding_release_platform": "windows_amd64_msvc",
+      "static_library": "caeneus-static.lib",
+      "node_prebuild": "win32-x64",
+      "python_arch": "AMD64"
+    }
+  ]
+}

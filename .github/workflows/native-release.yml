@@ -1,0 +1,297 @@
+name: Native release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  check-version:
+    name: Check release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - run: python tools/check-release-version.py "${GITHUB_REF_NAME}"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: check-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-latest
+            zig_target: x86_64-linux-gnu
+            static_lib: libcaeneus.a
+          - platform: linux_arm64
+            runner: ubuntu-latest
+            zig_target: aarch64-linux-gnu
+            static_lib: libcaeneus.a
+          - platform: darwin_arm64
+            runner: macos-latest
+            zig_target: aarch64-macos
+            static_lib: libcaeneus.a
+          - platform: windows_amd64
+            runner: ubuntu-latest
+            zig_target: x86_64-windows-gnu
+            static_lib: caeneus-static.lib
+          - platform: windows_amd64_msvc
+            runner: windows-2022
+            zig_target: x86_64-windows-msvc
+            static_lib: caeneus-static.lib
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build static library
+        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseFast -p zig-package
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "zig-package/lib/${{ matrix.static_lib }}"
+          test -f include/caeneus.h
+          mkdir package
+          cp "zig-package/lib/${{ matrix.static_lib }}" package/
+          cp include/caeneus.h package/
+          tar -C package -czf "caeneus-${GITHUB_REF_NAME}-${{ matrix.platform }}.tar.gz" .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.platform }}
+          path: caeneus-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > ../checksums.txt
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Caeneus ${GITHUB_REF_NAME}" \
+              --generate-notes
+          else
+            gh release edit "${GITHUB_REF_NAME}" \
+              --draft=false \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release upload "${GITHUB_REF_NAME}" \
+            --repo "$GITHUB_REPOSITORY" \
+            artifacts/*.tar.gz checksums.txt \
+            --clobber
+
+  python-wheels:
+    name: Build Python wheels (${{ matrix.platform }})
+    needs: release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-latest
+            cibw_arch: x86_64
+            stage_dir: /tmp/caeneus-native
+          - platform: linux_arm64
+            runner: ubuntu-latest
+            cibw_arch: aarch64
+            stage_dir: /tmp/caeneus-native
+          - platform: darwin_arm64
+            runner: macos-14
+            cibw_arch: arm64
+            stage_dir: /tmp/caeneus-native
+          - platform: windows_amd64
+            runner: windows-2022
+            cibw_arch: AMD64
+            stage_dir: C:/caeneus-native
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.platform == 'linux_arm64'
+
+      - name: Install wheel builder
+        run: python -m pip install --upgrade pip cibuildwheel
+
+      - name: Build wheels
+        env:
+          CIBW_BUILD: cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*
+          CIBW_ARCHS: ${{ matrix.cibw_arch }}
+          CIBW_MANYLINUX_X86_64: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64: manylinux_2_28
+          CIBW_BEFORE_BUILD: python {package}/build_native.py --version ${{ github.ref_name }} --dest ${{ matrix.stage_dir }}
+          CIBW_ENVIRONMENT: CAENEUS_NATIVE_STAGE=${{ matrix.stage_dir }} GITHUB_REPOSITORY=${{ github.repository }}
+          CIBW_TEST_COMMAND: python {package}/test_caeneus.py
+        run: python -m cibuildwheel --output-dir wheelhouse ext/python
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-wheels-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+
+  publish-python:
+    name: Publish Python package
+    needs: python-wheels
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/caeneus-native/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  node-prebuilds:
+    name: Build Node prebuild (${{ matrix.platform }})
+    needs: release
+    runs-on: ${{ matrix.runner }}
+    env:
+      npm_config_msvs_version: "2022"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: macos-14
+          - platform: win32-x64
+            runner: windows-2022
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Stage the tagged native archive
+        shell: bash
+        run: |
+          python tools/stage-native.py \
+            --version "${GITHUB_REF_NAME}" \
+            --dest "${RUNNER_TEMP}/caeneus-native"
+          echo "CAENEUS_ROOT=${GITHUB_WORKSPACE}" >> "${GITHUB_ENV}"
+          echo "CAENEUS_INCLUDE_DIR=${RUNNER_TEMP}/caeneus-native/include" >> "${GITHUB_ENV}"
+          echo "CAENEUS_LIBRARY_DIR=${RUNNER_TEMP}/caeneus-native/lib" >> "${GITHUB_ENV}"
+
+      - name: Install Node build tools
+        working-directory: ext/node
+        run: npm install
+
+      - name: Build the N-API prebuild
+        working-directory: ext/node
+        run: npm run build:prebuild -- "${{ matrix.platform }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: node-prebuild-${{ matrix.platform }}
+          path: ext/node/prebuilds
+
+  package-node:
+    name: Package Node binding
+    needs: node-prebuilds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install JavaScript build dependencies
+        working-directory: ext/node
+        run: npm install --ignore-scripts
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: node-prebuild-*
+          path: ext/node/prebuilds
+          merge-multiple: true
+
+      - name: Compile TypeScript and pack npm package
+        working-directory: ext/node
+        run: |
+          npm run build:js
+          mkdir -p "${RUNNER_TEMP}/node-package"
+          npm pack --pack-destination "${RUNNER_TEMP}/node-package"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: node-package
+          path: ${{ runner.temp }}/node-package/*.tgz
+
+  publish-node:
+    name: Publish Node package
+    needs: package-node
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: node-package
+          path: package
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+
+      - name: Update npm to latest (required for OIDC trusted publishing support)
+        run: npm install -g npm@latest
+
+      - name: Publish npm package
+        run: npm publish ./package/*.tgz --access public

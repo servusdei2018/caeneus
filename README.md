@@ -1,17 +1,13 @@
 # Caeneus
 
-Caeneus is a local, high-performance, in-memory cache engine written in Zig. It prioritizes concurrency, throughput, and maintaining a flat tail latency under concurrent write and eviction pressure.
+Caeneus is a concurrent in-memory cache engine written in Zig. It is designed
+for high throughput and predictable latency under concurrent reads, writes, and
+eviction.
 
 ## Get Started
 
 ```bash
-# Build
 zig build -Doptimize=ReleaseFast
-
-# Benchmark
-zig build run -Doptimize=ReleaseFast
-
-# Test
 zig build test
 ```
 
@@ -45,6 +41,32 @@ pub fn main() !void {
     }
 }
 ```
+
+## Bindings
+
+- Go, Python, and Node.js bindings are in [`ext/`](ext/).
+- Python and Node packages can be installed directly from their registries on
+  supported platforms:
+
+  ```bash
+  uv add caeneus-native
+  npm install caeneus-native
+  ```
+
+- Setup and contributor source-build instructions are in
+  [`GETTING_STARTED.md`](GETTING_STARTED.md).
+- Binding-specific build and API notes are in the corresponding README.
+
+## Benchmarks
+
+Run the quick integration suite with:
+
+```bash
+./benchmarks/run-all.sh --quick
+```
+
+See [`benchmarks/README.md`](benchmarks/README.md) for all runners and
+requirements.
 
 ## Contributing
 
