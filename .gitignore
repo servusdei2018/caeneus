@@ -29,3 +29,7 @@ ext/node/build/
 ext/node/dist/
 ext/node/prebuilds/
 ext/node/node_modules/
+
+# Benchmarks local run artifacts
+/benchmarks/assets/
+/benchmarks/.venv/
