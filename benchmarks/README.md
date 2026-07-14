@@ -56,3 +56,12 @@ returns a view over reusable native storage. Include the implementation,
 profile, operation count, worker count, value size, hit/miss counts, and
 runtime details with saved results. Exclude warmup and setup from steady-state
 measurements unless the benchmark reports them explicitly.
+
+## Results
+
+The following graphs are generated on a WSL system with an AMD Ryzen 7900X 12-core processor:
+
+![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/zig_benchmark.png?raw=true)
+![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/go_benchmark.png?raw=true)
+![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/python_benchmark.png?raw=true)
+![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/node_benchmark.png?raw=true)
