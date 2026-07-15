@@ -224,7 +224,7 @@ func extractArchive(contents []byte, dest, platform string) error {
 	defer gz.Close()
 
 	want := map[string]bool{
-		"caeneus.h":          true,
+		"caeneus.h":         true,
 		staticLib(platform): true,
 	}
 

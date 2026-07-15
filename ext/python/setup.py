@@ -79,7 +79,7 @@ extension = Extension(
 
 setup(
     name="caeneus-native",
-    version="0.1.1",
+    version="0.1.2",
     description="Compiled CPython extension for the Caeneus cache engine",
     packages=[],
     py_modules=[],
