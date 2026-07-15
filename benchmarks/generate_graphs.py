@@ -109,7 +109,7 @@ def run_python_mt():
         "--implementation", "caeneus,plain_dict,lru_dict",
         "--workers", "8",
         "--mode", "shared",
-        "--api", "get",
+        "--api", "get_into",
         "--operations-per-worker", "10000",
         "--sample-rate", "100"
     ], capture_output=True, text=True, env=env, check=True)

@@ -52,9 +52,13 @@ The regular addon is portable across supported Node versions. The optional
 `npm run build:native:fast` target enables the experimental V8 Fast API path.
 It is tied to the Node/V8 version and is not required by the TypeScript API.
 
-`Cache.get()` returns a `Buffer` view over reusable native storage. Consume the
-view before the next `get()` call.
+`Cache.get()` returns a `Buffer` view over reusable native scratch storage.
+Consume the view before the next `get()` call — a later read may overwrite the
+same backing memory (same-length hits reuse the same Buffer object). Keys may
+be strings or `Buffer`s; prefer `Buffer` keys when you already have bytes to
+skip string conversion.
 
-For reusable output, `Cache.getInto(key, output)` writes into a caller-owned
-`Buffer` and returns the byte count, or `null` for a miss. The output buffer
-must be large enough for the value.
+Default published charts measure `--api get`. For reusable caller-owned output
+with no Buffer wrapper on the hot path, use `Cache.getInto(key, output)`: it
+writes into a caller-owned `Buffer` and returns the byte count, or `null` for a
+miss. The output buffer must be large enough for the value.

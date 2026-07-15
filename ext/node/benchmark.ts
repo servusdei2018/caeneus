@@ -157,13 +157,29 @@ function parseOptions(): Options {
   };
 }
 
-function createAdapter(name: string, profile: Profile): CacheAdapter {
+// Maximum total native slab bytes across all workers for a single caeneus
+// Cache. Each worker gets an equal share so RSS stays bounded regardless of
+// how many workers --workers specifies. 1 GiB is a generous but safe ceiling
+// for a benchmark tool running alongside other system processes.
+const kMaxTotalSlabBytes = 1 * 1024 * 1024 * 1024;
+
+function createAdapter(
+  name: string,
+  profile: Profile,
+  workers: number,
+): CacheAdapter {
   if (name === "caeneus") {
     const slots = Math.max(64, Math.ceil(profile.capacity / 64));
+    // Divide the total budget equally across workers so that spawning N
+    // workers does not multiply native (c_allocator) heap by N.
+    const slabSizePerShard = Math.max(
+      64 * 1024,
+      Math.floor(kMaxTotalSlabBytes / (64 * Math.max(1, workers))),
+    );
     return new Cache({
       numShards: 64,
       slotsPerShard: slots,
-      slabSizePerShard: 16 * 1024 * 1024,
+      slabSizePerShard,
     });
   }
   if (name === "map") {
@@ -217,6 +233,7 @@ function runSingle(
   valueSize: number,
   sampleRate: number,
   api: Options["api"],
+  workers: number,
 ): Record<string, string | number> {
   const keys = Array.from(
     { length: profile.keys },
@@ -225,7 +242,7 @@ function runSingle(
   const workload = buildWorkload(profile, keys);
   const value = Buffer.alloc(valueSize, 0x61);
   const output = Buffer.alloc(valueSize);
-  const cache = createAdapter(implementation, profile);
+  const cache = createAdapter(implementation, profile, workers);
   try {
     for (const key of keys) {
       cache.set(key, value);
@@ -305,6 +322,7 @@ async function runFromWorker(): Promise<void> {
     valueSize: number;
     sampleRate: number;
     api: Options["api"];
+    workers: number;
   };
   parentPort?.postMessage(
     runSingle(
@@ -313,6 +331,7 @@ async function runFromWorker(): Promise<void> {
       request.valueSize,
       request.sampleRate,
       request.api,
+      request.workers,
     ),
   );
 }
@@ -342,6 +361,7 @@ async function runFromMain(): Promise<void> {
             options.valueSize,
             options.sampleRate,
             options.api,
+            options.workers,
           ),
         ];
       } else {
@@ -355,6 +375,7 @@ async function runFromMain(): Promise<void> {
                   valueSize: options.valueSize,
                   sampleRate: options.sampleRate,
                   api: options.api,
+                  workers: options.workers,
                 },
               });
               worker.once("message", resolve);

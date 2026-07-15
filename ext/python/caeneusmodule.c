@@ -17,6 +17,9 @@ typedef struct {
     int concurrent_mode;
     /* GIL-protected initial capacity for one-copy small-value reads. */
     Py_ssize_t get_capacity;
+    /* Retained bytes object for get() reuse when the caller dropped the prior result. */
+    PyObject *get_freelist;
+    Py_ssize_t freelist_capacity;
 } CaeneusCache;
 
 static inline int32_t result_code(uint64_t packed) {
@@ -150,6 +153,55 @@ native_set(CaeneusCache *self,
     return 0;
 }
 
+static void
+clear_get_freelist(CaeneusCache *self) {
+    Py_XDECREF(self->get_freelist);
+    self->get_freelist = NULL;
+    self->freelist_capacity = 0;
+}
+
+/*
+ * acquire_get_output returns a writable bytes object of at least `capacity`
+ * bytes. When the freelist object is exclusively owned and large enough it is
+ * reused; otherwise a fresh bytes object is allocated.
+ */
+static PyObject *
+acquire_get_output(CaeneusCache *self, Py_ssize_t capacity) {
+    PyObject *output = self->get_freelist;
+    if (output != NULL &&
+        Py_REFCNT(output) == 1 &&
+        self->freelist_capacity >= capacity) {
+        self->get_freelist = NULL;
+        Py_SET_SIZE((PyVarObject *)output, self->freelist_capacity);
+        ((char *)PyBytes_AS_STRING(output))[self->freelist_capacity] = '\0';
+        return output;
+    }
+    clear_get_freelist(self);
+    return PyBytes_FromStringAndSize(NULL, capacity);
+}
+
+static void
+store_get_freelist(CaeneusCache *self, PyObject *output, Py_ssize_t capacity) {
+    if (self->get_freelist == NULL) {
+        self->get_freelist = output;
+        Py_INCREF(output);
+        self->freelist_capacity = capacity;
+    }
+}
+
+static void
+abandon_get_output(CaeneusCache *self, PyObject *output, Py_ssize_t capacity) {
+    if (output == NULL) {
+        return;
+    }
+    if (self->get_freelist == NULL && Py_REFCNT(output) == 1) {
+        self->get_freelist = output;
+        self->freelist_capacity = capacity;
+        return;
+    }
+    Py_DECREF(output);
+}
+
 static int
 native_get(CaeneusCache *self,
            const unsigned char *key_data,
@@ -158,12 +210,18 @@ native_get(CaeneusCache *self,
            Py_ssize_t buffer_length,
            uint64_t *packed) {
     /*
-     * Small reads complete faster than a GIL handoff. Keep the common
-     * stack-buffer/get_into path on the GIL, while large copies can overlap
-     * with other native work without making tiny reads scheduler-bound.
+     * Tiny single-thread reads stay on the GIL (handoff costs more than the
+     * lookup). Once concurrent_mode latches, release even for small buffers so
+     * shared multi-worker workloads can overlap.
      */
+    if (!self->concurrent_mode &&
+        atomic_load_explicit(&self->active_calls, memory_order_relaxed) != 0) {
+        self->concurrent_mode = 1;
+    }
     const int release_gil =
-        buffer_length > 1024 && should_release_gil(self);
+        self->concurrent_mode
+            ? 1
+            : (buffer_length > 1024 && should_release_gil(self));
     if (!release_gil) {
         void *handle = NULL;
         if (get_open_handle(self, &handle) < 0) {
@@ -208,7 +266,7 @@ cache_init(CaeneusCache *self, PyObject *args, PyObject *kwargs) {
     unsigned int num_shards = 64;
     unsigned int slots_per_shard = 1024;
     unsigned long long slab_size_per_shard = 1024ULL * 1024ULL;
-    unsigned long long initial_value_capacity = 0;
+    unsigned long long initial_value_capacity = 128;
 
     if (!PyArg_ParseTupleAndKeywords(
             args,
@@ -241,6 +299,8 @@ cache_init(CaeneusCache *self, PyObject *args, PyObject *kwargs) {
     atomic_init(&self->active_calls, 0);
     self->gil_probe = 1024;
     self->concurrent_mode = 0;
+    self->get_freelist = NULL;
+    self->freelist_capacity = 0;
 
     void *handle = NULL;
     Py_BEGIN_ALLOW_THREADS
@@ -264,6 +324,7 @@ cache_init(CaeneusCache *self, PyObject *args, PyObject *kwargs) {
 
 static void
 cache_dealloc(CaeneusCache *self) {
+    clear_get_freelist(self);
     if (self->handle != NULL) {
         void *handle = self->handle;
         self->handle = NULL;
@@ -278,6 +339,7 @@ cache_dealloc(CaeneusCache *self) {
 
 static PyObject *
 cache_close(CaeneusCache *self, PyObject *Py_UNUSED(ignored)) {
+    clear_get_freelist(self);
     if (self->handle != NULL) {
         void *handle = self->handle;
         self->handle = NULL;
@@ -351,22 +413,25 @@ cache_get_impl(CaeneusCache *self, PyObject *key_object, int is_subscript) {
     unsigned char stack_buf[1024];
     PyObject *output = NULL;
     Py_ssize_t output_capacity = self->get_capacity;
+    Py_ssize_t owned_capacity = 0;
     uint64_t packed = 0;
     if (output_capacity > 0) {
-        output = PyBytes_FromStringAndSize(NULL, output_capacity);
+        output = acquire_get_output(self, output_capacity);
         if (output == NULL) {
             return NULL;
         }
+        owned_capacity = PyBytes_GET_SIZE(output);
         if (native_get(
                 self,
                 key_data,
                 key_length,
                 (unsigned char *)PyBytes_AS_STRING(output),
-                output_capacity,
+                owned_capacity,
                 &packed) < 0) {
-            Py_DECREF(output);
+            abandon_get_output(self, output, owned_capacity);
             return NULL;
         }
+        output_capacity = owned_capacity;
     } else {
         if (native_get(
                 self,
@@ -383,7 +448,7 @@ cache_get_impl(CaeneusCache *self, PyObject *key_object, int is_subscript) {
     uint32_t required_length = result_length(packed);
 
     if (status == CAENEUS_MISS) {
-        Py_XDECREF(output);
+        abandon_get_output(self, output, output_capacity);
         if (is_subscript) {
             PyErr_SetObject(PyExc_KeyError, key_object);
             return NULL;
@@ -391,14 +456,14 @@ cache_get_impl(CaeneusCache *self, PyObject *key_object, int is_subscript) {
         Py_RETURN_NONE;
     }
     if (status == CAENEUS_ERR_PANIC) {
-        Py_XDECREF(output);
+        abandon_get_output(self, output, output_capacity);
         PyErr_SetString(PyExc_RuntimeError, "caeneus get failed");
         return NULL;
     }
     if (status == CAENEUS_OK) {
         if (output != NULL) {
             if ((uint64_t)required_length > (uint64_t)output_capacity) {
-                Py_DECREF(output);
+                abandon_get_output(self, output, output_capacity);
                 PyErr_SetString(
                     PyExc_RuntimeError,
                     "caeneus returned a value larger than its output buffer");
@@ -411,6 +476,7 @@ cache_get_impl(CaeneusCache *self, PyObject *key_object, int is_subscript) {
                 Py_SET_SIZE((PyVarObject *)output, (Py_ssize_t)required_length);
             }
             self->get_capacity = (Py_ssize_t)required_length;
+            store_get_freelist(self, output, output_capacity);
             return output;
         }
         return PyBytes_FromStringAndSize(
@@ -418,15 +484,15 @@ cache_get_impl(CaeneusCache *self, PyObject *key_object, int is_subscript) {
             (Py_ssize_t)required_length);
     }
 
-    // Fallback: value is larger than 1024 bytes.
+    // Fallback: value is larger than the current buffer.
     if (status != CAENEUS_ERR_SMALL_BUF) {
-        Py_XDECREF(output);
+        abandon_get_output(self, output, output_capacity);
         PyErr_SetString(PyExc_RuntimeError, "caeneus returned an invalid get status");
         return NULL;
     }
 
     // Retry loop for the fallback heap path
-    Py_XDECREF(output);
+    abandon_get_output(self, output, output_capacity);
     output = NULL;
     output_capacity = (Py_ssize_t)required_length;
     for (unsigned int attempt = 0; attempt < 8; attempt++) {
@@ -473,19 +539,20 @@ cache_get_impl(CaeneusCache *self, PyObject *key_object, int is_subscript) {
             return NULL;
         }
 
-        PyObject *output = PyBytes_FromStringAndSize(NULL, output_capacity);
+        output = acquire_get_output(self, output_capacity);
         if (output == NULL) {
             return NULL;
         }
+        owned_capacity = PyBytes_GET_SIZE(output);
 
         if (native_get(
                 self,
                 key_data,
                 key_length,
                 (unsigned char *)PyBytes_AS_STRING(output),
-                output_capacity,
+                owned_capacity,
                 &packed) < 0) {
-            Py_DECREF(output);
+            abandon_get_output(self, output, owned_capacity);
             return NULL;
         }
 
@@ -493,7 +560,7 @@ cache_get_impl(CaeneusCache *self, PyObject *key_object, int is_subscript) {
         required_length = result_length(packed);
 
         if (status == CAENEUS_MISS) {
-            Py_DECREF(output);
+            abandon_get_output(self, output, owned_capacity);
             if (is_subscript) {
                 PyErr_SetObject(PyExc_KeyError, key_object);
                 return NULL;
@@ -501,28 +568,29 @@ cache_get_impl(CaeneusCache *self, PyObject *key_object, int is_subscript) {
             Py_RETURN_NONE;
         }
         if (status == CAENEUS_ERR_PANIC) {
-            Py_DECREF(output);
+            abandon_get_output(self, output, owned_capacity);
             PyErr_SetString(PyExc_RuntimeError, "caeneus get failed");
             return NULL;
         }
         if (status == CAENEUS_OK) {
-            if ((uint64_t)required_length > (uint64_t)output_capacity) {
-                Py_DECREF(output);
+            if ((uint64_t)required_length > (uint64_t)owned_capacity) {
+                abandon_get_output(self, output, owned_capacity);
                 PyErr_SetString(PyExc_RuntimeError, "caeneus returned a value larger than its output buffer");
                 return NULL;
             }
-            // If the returned value is smaller than allocated capacity, we need to resize
-            if ((Py_ssize_t)required_length < output_capacity) {
+            if ((Py_ssize_t)required_length < owned_capacity) {
                 unsigned char *output_data = (unsigned char *)PyBytes_AS_STRING(output);
                 output_data[required_length] = '\0';
                 Py_SET_SIZE((PyVarObject *)output, (Py_ssize_t)required_length);
             }
             self->get_capacity = (Py_ssize_t)required_length;
+            store_get_freelist(self, output, owned_capacity);
             return output;
         }
 
         // If status == CAENEUS_ERR_SMALL_BUF
-        Py_DECREF(output);
+        abandon_get_output(self, output, owned_capacity);
+        output = NULL;
         output_capacity = (Py_ssize_t)required_length;
     }
 
@@ -708,8 +776,8 @@ static PyTypeObject CaeneusCacheType = {
         "num_shards must be a power of two. slots_per_shard must be at least "
         "64. slab_size_per_shard must be at least the system page size.\n"
         "\n"
-        "initial_value_capacity optionally seeds the read buffer size; zero "
-        "uses a size probe on the first read.",
+        "initial_value_capacity optionally seeds the read buffer size "
+        "(default 128); zero uses a size probe on the first read.",
     .tp_basicsize = sizeof(CaeneusCache),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = cache_methods,
@@ -727,7 +795,7 @@ cache_vectorcall(PyObject *type, PyObject *const *args, size_t nargsf, PyObject 
     unsigned int num_shards = 64;
     unsigned int slots_per_shard = 1024;
     unsigned long long slab_size_per_shard = 1024ULL * 1024ULL;
-    unsigned long long initial_value_capacity = 0;
+    unsigned long long initial_value_capacity = 128;
 
     for (Py_ssize_t i = 0; i < nargs; i++) {
         PyObject *val = args[i];
@@ -819,6 +887,8 @@ cache_vectorcall(PyObject *type, PyObject *const *args, size_t nargsf, PyObject 
     self->gil_probe = 1024;
     self->concurrent_mode = 0;
     self->get_capacity = (Py_ssize_t)initial_value_capacity;
+    self->get_freelist = NULL;
+    self->freelist_capacity = 0;
 
     void *handle = NULL;
     Py_BEGIN_ALLOW_THREADS

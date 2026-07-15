@@ -106,7 +106,16 @@ pub const Shard = struct {
 
         const builtin_info = @import("builtin");
         if (builtin_info.os.tag == .linux) {
-            std.posix.madvise(@alignCast(slab_buf.ptr), slab_buf.len, std.posix.MADV.HUGEPAGE) catch {};
+            // Only request THP for slabs that are already hugepage-sized
+            // (>= 2 MiB) and below a per-shard ceiling (256 MiB).  Asking
+            // for hugepages on dozens of large arenas simultaneously drives
+            // khugepaged into expensive compact-zone walks under memory
+            // pressure, which can stall or OOM adjacent processes.
+            const thp_min = 2 * 1024 * 1024;
+            const thp_max = 256 * 1024 * 1024;
+            if (slab_buf.len >= thp_min and slab_buf.len <= thp_max) {
+                std.posix.madvise(@alignCast(slab_buf.ptr), slab_buf.len, std.posix.MADV.HUGEPAGE) catch {};
+            }
         }
 
         const shard = Shard{
@@ -224,13 +233,15 @@ pub const Shard = struct {
                 seq1 = self.seq.load(.acquire);
             }
 
-            const slot_idx = self.lookup(key, hash);
-            if (slot_idx == invalid_slot_idx) {
+            const hit = self.lookupHit(key, hash);
+            if (hit == null) {
                 const seq2 = self.seq.load(.acquire);
                 if (seq1 == seq2) return null;
                 self.noteSeqlockRetry();
                 continue;
             }
+            const slot_idx = hit.?.slot_idx;
+            const hit_offset = hit.?.offset;
 
             const meta_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.metadata[slot_idx])), .acquire);
             const metadata = @as(SlotMetadata, @bitCast(meta_u64));
@@ -251,21 +262,20 @@ pub const Shard = struct {
                 continue;
             }
 
-            const offset = metadata.offset;
-            if (offset >= self.slab.buffer.len or self.slab.buffer.len - offset < @sizeOf(BlockHeader)) continue;
-            const header = self.slab.readHeader(offset);
-            const needed_len = @as(usize, @sizeOf(BlockHeader)) + header.key_len + metadata.len;
-            if (self.slab.buffer.len - offset < needed_len) continue;
-
-            const stored_key = self.slab.buffer[offset + @sizeOf(BlockHeader) ..][0..header.key_len];
-            if (!std.mem.eql(u8, stored_key, key)) {
-                const seq2 = self.seq.load(.acquire);
-                if (seq1 == seq2) return null; // hash collision
+            // lookupHit already validated the key at hit_offset. Skip a second
+            // slab key compare when the slot still points at that offset.
+            if (metadata.offset != hit_offset) {
+                self.noteSeqlockRetry();
+                continue;
+            }
+            const offset = hit_offset;
+            const needed_len = @as(usize, @sizeOf(BlockHeader)) + key.len + metadata.len;
+            if (offset >= self.slab.buffer.len or self.slab.buffer.len - offset < needed_len) {
                 self.noteSeqlockRetry();
                 continue;
             }
 
-            const val_offset = offset + @sizeOf(BlockHeader) + header.key_len;
+            const val_offset = offset + @sizeOf(BlockHeader) + key.len;
             const stored_val = self.slab.buffer[val_offset..][0..metadata.len];
             @memcpy(buf[0..metadata.len], stored_val);
 
@@ -370,7 +380,17 @@ pub const Shard = struct {
         self.probationary_head = (self.probationary_head + 1) % self.num_probationary;
     }
 
+    const LookupHit = struct {
+        slot_idx: u32,
+        offset: u32,
+    };
+
     fn lookup(self: *Shard, key: []const u8, hash: u64) u32 {
+        const hit = self.lookupHit(key, hash) orelse return invalid_slot_idx;
+        return hit.slot_idx;
+    }
+
+    fn lookupHit(self: *Shard, key: []const u8, hash: u64) ?LookupHit {
         const mask = self.index_mask;
         const hash_low = @as(u32, @intCast(hash & 0xFFFFFFFF));
         var idx = @as(usize, hash_low) & mask;
@@ -379,35 +399,38 @@ pub const Shard = struct {
             const entry_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.table[idx])), .monotonic);
             const entry = @as(IndexEntry, @bitCast(entry_u64));
             if (entry.slot_idx == invalid_slot_idx) {
-                return invalid_slot_idx;
+                return null;
             }
             if (entry.slot_idx == tombstone_slot_idx) {
                 idx = (idx + 1) & mask;
                 continue;
             }
-            if (entry.hash_low == hash_low and self.keyEquals(entry.slot_idx, key)) {
-                return entry.slot_idx;
+            if (entry.hash_low == hash_low) {
+                if (self.keyEqualsOffset(entry.slot_idx, key)) |offset| {
+                    return .{ .slot_idx = entry.slot_idx, .offset = offset };
+                }
             }
             idx = (idx + 1) & mask;
         }
     }
 
-    inline fn keyEquals(self: *Shard, slot_idx: u32, key: []const u8) bool {
-        if (slot_idx >= self.total_slots) return false;
+    inline fn keyEqualsOffset(self: *Shard, slot_idx: u32, key: []const u8) ?u32 {
+        if (slot_idx >= self.total_slots) return null;
         const meta_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.metadata[slot_idx])), .acquire);
         const metadata = @as(SlotMetadata, @bitCast(meta_u64));
         const offset = metadata.offset;
-        if (offset == invalid_offset) return false;
+        if (offset == invalid_offset) return null;
 
-        if (offset >= self.slab.buffer.len or self.slab.buffer.len - offset < @sizeOf(BlockHeader)) return false;
+        if (offset >= self.slab.buffer.len or self.slab.buffer.len - offset < @sizeOf(BlockHeader)) return null;
         const header = self.slab.readHeader(offset);
-        if (header.key_len != key.len) return false;
+        if (header.key_len != key.len) return null;
 
         const needed_len = @as(usize, @sizeOf(BlockHeader)) + header.key_len;
-        if (self.slab.buffer.len - offset < needed_len) return false;
+        if (self.slab.buffer.len - offset < needed_len) return null;
 
         const stored_key = self.slab.buffer[offset + @sizeOf(BlockHeader) ..][0..header.key_len];
-        return std.mem.eql(u8, stored_key, key);
+        if (!std.mem.eql(u8, stored_key, key)) return null;
+        return offset;
     }
 
     fn insertIndexMap(self: *Shard, hash: u64, slot_idx: u32) void {
@@ -470,7 +493,9 @@ pub const Shard = struct {
     }
 
     fn maybeRebuildIndexMap(self: *Shard) void {
-        const threshold: u32 = @intCast(@max(@as(usize, 1), self.table.len / 8));
+        // Rebuild when tombstones reach 25% of the table. The prior 12.5%
+        // threshold rebuilt too often under eviction storms (Profile B p99).
+        const threshold: u32 = @intCast(@max(@as(usize, 1), self.table.len / 4));
         if (self.tombstones < threshold) return;
 
         const empty_u64 = @as(u64, @bitCast(IndexEntry{ .hash_low = 0, .slot_idx = invalid_slot_idx }));
@@ -500,6 +525,13 @@ pub const Shard = struct {
         const M = self.num_main;
         const total = P + M;
 
+        // Snapshot the starting position so we can detect a full lap.
+        // If every slot in the main pool is visited (e.g. all-hot read
+        // workload), the old unbounded loop spun forever.  After one full
+        // sweep we've cleared all visited bits along the way; force-evict
+        // the current hand position rather than spinning again.
+        const start = self.hand;
+
         while (true) {
             const slot = self.hand;
             self.hand += 1;
@@ -507,10 +539,17 @@ pub const Shard = struct {
                 self.hand = P;
             }
 
-            if (self.visited.testAndUnsetAtomic(slot)) {
-                // Was visited, now cleared.
-            } else {
+            if (!self.visited.testAndUnsetAtomic(slot)) {
                 return slot;
+            }
+
+            // Full lap: all slots were visited.  We've already cleared every
+            // bit as we went, so just evict wherever the hand sits now.
+            if (self.hand == start) {
+                const force = self.hand;
+                self.hand += 1;
+                if (self.hand >= total) self.hand = P;
+                return force;
             }
         }
     }

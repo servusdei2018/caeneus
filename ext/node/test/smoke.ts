@@ -12,6 +12,10 @@ test("set/get supports strings and binary values", () => {
     const binary = Buffer.from([0, 1, 2, 255]);
     cache.set("binary", binary);
     assert.deepEqual(cache.get("binary"), binary);
+
+    const key = Buffer.from("buf-key");
+    cache.set(key, Buffer.from("buf-value"));
+    assert.deepEqual(cache.get(key), Buffer.from("buf-value"));
   } finally {
     cache.close();
   }
@@ -40,6 +44,26 @@ test("getInto writes into a caller-owned Buffer", () => {
       () => cache.getInto("buffered", Buffer.alloc(1)),
       /too small/,
     );
+  } finally {
+    cache.close();
+  }
+});
+
+test("get returns a Buffer view over reusable scratch storage", () => {
+  const cache = new Cache();
+  try {
+    cache.set("a", "same-size-value!");
+    const first = cache.get("a");
+    assert.ok(Buffer.isBuffer(first));
+    assert.equal(first?.toString(), "same-size-value!");
+
+    cache.set("b", "same-size-value?");
+    const second = cache.get("b");
+    assert.ok(Buffer.isBuffer(second));
+    assert.equal(second?.toString(), "same-size-value?");
+    // Same-length hits reuse the cached view object; contents are overwritten.
+    assert.equal(first, second);
+    assert.equal(first?.toString(), "same-size-value?");
   } finally {
     cache.close();
   }

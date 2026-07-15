@@ -363,6 +363,41 @@ test "basic operations" {
     try std.testing.expectEqualSlices(u8, "low-latency", got_short.?);
 }
 
+test "lookup hit matches get for many keys" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, 2, 512, 512 * 1024);
+    defer engine.deinit();
+
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [64]u8 = undefined;
+    var read_buf: [64]u8 = undefined;
+    @memset(&value_buf, 'v');
+
+    // Touch each key after insert so SIEVE promotes instead of in-place eviction.
+    const n: usize = 200;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "k_{}", .{i});
+        const value = value_buf[0 .. (i % 63) + 1];
+        try engine.set(key, value);
+        const got = try engine.get(key, &read_buf, null);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualSlices(u8, value, got.?);
+    }
+
+    i = 0;
+    while (i < n) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "k_{}", .{i});
+        const value = value_buf[0 .. (i % 63) + 1];
+        const got = try engine.get(key, &read_buf, null);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualSlices(u8, value, got.?);
+    }
+
+    const miss = try engine.get("k_missing", &read_buf, null);
+    try std.testing.expect(miss == null);
+}
+
 test "eviction correctness" {
     const allocator = std.testing.allocator;
     var engine = try Engine.init(allocator, 1, 64, 16 * 1024);
@@ -434,7 +469,9 @@ test "index rebuild survives eviction churn" {
 
 test "concurrency safety under heavy contention" {
     const allocator = std.testing.allocator;
-    var engine = try Engine.init(allocator, 16, 256, 64 * 1024);
+    // 16 shards × 256 slots; values are 10-60 bytes each.
+    // 32 KiB per shard is ample; keep it small so CI doesn't touch hugepages.
+    var engine = try Engine.init(allocator, 16, 256, 32 * 1024);
     defer engine.deinit();
 
     const num_threads = 4;
@@ -453,7 +490,10 @@ test "concurrency safety under heavy contention" {
 
 test "distributed reads stay lock-free after sorted warmup" {
     const allocator = std.testing.allocator;
-    var engine = try Engine.init(allocator, 32, 1024, 4 * 1024 * 1024);
+    // 32 shards × 1024 slots; 8 workers × 128 keys × 128-byte values = ~262 KiB
+    // of payload.  256 KiB per shard is sufficient and stays well below the
+    // 2 MiB hugepage threshold, avoiding khugepaged pressure in CI.
+    var engine = try Engine.init(allocator, 32, 1024, 256 * 1024);
     defer engine.deinit();
 
     var key_buf: [32]u8 = undefined;

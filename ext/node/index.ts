@@ -2,6 +2,9 @@ import { Buffer } from "node:buffer";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 
+/** Key type accepted by Cache methods. */
+export type CacheKey = string | Buffer;
+
 interface NativeBinding {
   createCache(
     numShards?: number,
@@ -9,14 +12,22 @@ interface NativeBinding {
     slabSizePerShard?: number,
   ): unknown;
   closeCache(cache: unknown): void;
-  set(cache: unknown, key: string, value: string | Buffer): void;
-  get(cache: unknown, key: string): number | null;
-  getInto(cache: unknown, key: string, output: Buffer): number | null;
+  set(cache: unknown, key: CacheKey, value: string | Buffer): void;
+  get(cache: unknown, key: CacheKey): Buffer | null;
+  getInto(cache: unknown, key: CacheKey, output: Buffer): number | null;
   scratch(cache: unknown): Buffer;
   fastApiAvailable(): boolean;
 }
 
 function nativeBindingPath(): string {
+  // Prefer the locally-compiled addon so that a source checkout always runs
+  // the freshest build.  In a published npm install the local build does not
+  // exist, so we fall through to the prebuilt.
+  const local = path.join(__dirname, "..", "build", "Release", "caeneus.node");
+  if (existsSync(local)) {
+    return local;
+  }
+
   const prebuilt = path.join(
     __dirname,
     "..",
@@ -26,11 +37,6 @@ function nativeBindingPath(): string {
   );
   if (existsSync(prebuilt)) {
     return prebuilt;
-  }
-
-  const local = path.join(__dirname, "..", "build", "Release", "caeneus.node");
-  if (existsSync(local)) {
-    return local;
   }
 
   throw new Error(
@@ -68,7 +74,6 @@ export interface CacheOptions {
  */
 export class Cache {
   private readonly handle: unknown;
-  private scratchBuffer: Buffer;
   private closed = false;
 
   /**
@@ -86,16 +91,15 @@ export class Cache {
       slotsPerShard,
       slabSizePerShard,
     );
-    this.scratchBuffer = native.scratch(this.handle);
   }
 
   /**
    * `set` stores the value for key in the cache.
    *
-   * The key must be a string. The value may be a string or a Buffer. The cache
-   * does not retain the input Buffer.
+   * The key and value may each be a string or a Buffer. The cache does not
+   * retain the input Buffer.
    */
-  public set(key: string, value: string | Buffer): void {
+  public set(key: CacheKey, value: string | Buffer): void {
     this.assertOpen();
     native.set(this.handle, key, value);
   }
@@ -104,22 +108,17 @@ export class Cache {
    * `get` retrieves the value for key.
    *
    * It returns a Buffer view, or null if key is not in the cache. The returned
-   * view uses reusable native-owned storage; consume it before the next get
-   * call, because a subsequent read may overwrite its contents.
+   * view uses reusable native scratch storage; consume it before the next get
+   * call. Same-length hits may return the same Buffer object with overwritten
+   * contents.
+   *
+   * The scratch buffer is capped at 4 MiB. If the stored value exceeds that
+   * limit, `get` throws a `RangeError`. Use {@link getInto} with a
+   * caller-managed Buffer for values larger than 4 MiB.
    */
-  public get(key: string): Buffer | null {
+  public get(key: CacheKey): Buffer | null {
     this.assertOpen();
-    const outputLength = native.get(this.handle, key);
-    if (outputLength === null) {
-      return null;
-    }
-
-    // The native scratch allocation only grows. Avoid a Node-API call on the
-    // stable hot path; refresh the pinned Buffer only after a resize.
-    if (outputLength > this.scratchBuffer.length) {
-      this.scratchBuffer = native.scratch(this.handle);
-    }
-    return Buffer.from(this.scratchBuffer.buffer, 0, outputLength);
+    return native.get(this.handle, key);
   }
 
   /**
@@ -128,7 +127,7 @@ export class Cache {
    * It returns the number of bytes written, or null if key is not in the
    * cache. output must be large enough to hold the value.
    */
-  public getInto(key: string, output: Buffer): number | null {
+  public getInto(key: CacheKey, output: Buffer): number | null {
     this.assertOpen();
     return native.getInto(this.handle, key, output);
   }

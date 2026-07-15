@@ -92,7 +92,9 @@ pub const SlabPool = struct {
         var total_len = init_header.block_len;
         var scan_offset = self.write_ptr + total_len;
         while (total_len < needed_len) {
+            if (scan_offset >= S) return error.SlabCorrupted;
             const header = self.readHeader(scan_offset);
+            if (header.block_len == 0) return error.SlabCorrupted;
             if (header.slot_idx != invalid_slot_idx) {
                 if (self.shard.isSlotActive(header.slot_idx, scan_offset)) {
                     self.shard.evictSlot(header.slot_idx);
@@ -137,7 +139,9 @@ pub const SlabPool = struct {
     }
 
     fn precleanTail(self: *SlabPool, S: u32) void {
-        const threshold = @min(S, @as(u32, 64 * 1024));
+        // Start incremental reclaim once the remaining tail is within 128 KiB so
+        // wrap-time full-tail scans are rarer under eviction churn.
+        const threshold = @min(S, @as(u32, 128 * 1024));
         if (S - self.write_ptr > threshold) return;
 
         if (self.reclaim_ptr == S or self.reclaim_ptr < self.write_ptr) {
@@ -145,7 +149,8 @@ pub const SlabPool = struct {
         }
         if (self.reclaim_ptr >= S) return;
 
-        const budget_end = @min(S, self.reclaim_ptr + @as(u32, 4 * 1024));
+        // Wider per-allocate budget clears more pending blocks before wrap.
+        const budget_end = @min(S, self.reclaim_ptr + @as(u32, 16 * 1024));
         self.reclaim_ptr = self.scanReclaimRange(self.reclaim_ptr, budget_end);
     }
 
