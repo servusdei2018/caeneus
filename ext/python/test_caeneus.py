@@ -25,6 +25,23 @@ class CacheTests(unittest.TestCase):
         finally:
             cache.close()
 
+    def test_mapping_protocol(self) -> None:
+        cache = self.make_cache()
+        try:
+            cache["hello"] = "world"
+            self.assertEqual(cache["hello"], b"world")
+
+            cache[b"binary"] = bytes([0, 1, 2, 255])
+            self.assertEqual(cache[b"binary"], bytes([0, 1, 2, 255]))
+
+            with self.assertRaises(KeyError):
+                _ = cache["missing"]
+
+            with self.assertRaises(TypeError):
+                del cache["hello"]
+        finally:
+            cache.close()
+
     def test_miss_returns_none(self) -> None:
         cache = self.make_cache()
         try:
@@ -67,10 +84,19 @@ class CacheTests(unittest.TestCase):
         try:
             value = b"zero-copy destination"
             cache.set("buffered", value)
+
+            # 1. Direct bytearray (triggers direct bytearray fast-path)
             output = bytearray(64)
             output_length = cache.get_into("buffered", output)
             self.assertEqual(output_length, len(value))
             self.assertEqual(bytes(output[:output_length]), value)
+
+            # 2. memoryview of bytearray (triggers generic buffer fallback-path)
+            output_mv = memoryview(bytearray(64))
+            output_length_mv = cache.get_into("buffered", output_mv)
+            self.assertEqual(output_length_mv, len(value))
+            self.assertEqual(bytes(output_mv[:output_length_mv]), value)
+
             self.assertIsNone(cache.get_into("missing", output))
             with self.assertRaises(BufferError):
                 cache.get_into("buffered", bytearray(1))
@@ -117,6 +143,35 @@ class CacheTests(unittest.TestCase):
         cache.close()
         with self.assertRaises(RuntimeError):
             cache.get("closed")
+
+    def test_constructor_arguments(self) -> None:
+        # Test default arguments
+        c1 = caeneus.Cache()
+        c1.close()
+
+        # Test positional arguments
+        c2 = caeneus.Cache(16, 1024, 4 * 1024 * 1024)
+        c2.close()
+
+        # Test keyword arguments
+        c3 = caeneus.Cache(num_shards=8, slots_per_shard=512)
+        c3.close()
+
+        # Test mixed positional/keyword
+        c4 = caeneus.Cache(16, slots_per_shard=256)
+        c4.close()
+
+        # Test invalid positional count
+        with self.assertRaises(TypeError):
+            caeneus.Cache(16, 1024, 4096, 0, 999)
+
+        # Test invalid keyword argument
+        with self.assertRaises(TypeError):
+            caeneus.Cache(num_shards=16, invalid_arg=True)
+
+        # Test negative integer value
+        with self.assertRaises(ValueError):
+            caeneus.Cache(num_shards=-1)
 
 
 if __name__ == "__main__":

@@ -32,8 +32,11 @@ Published wheels currently cover Linux x86_64/aarch64, macOS arm64, and
 Windows x86_64. Other platforms can use the source-build path with a suitable
 native archive.
 
-`Cache.get()` returns a new Python `bytes` object. Native calls run outside the
-GIL, and repeated reads reuse the learned value capacity.
+`Cache.get()` returns a new Python `bytes` object. Large native operations and
+contended writes run outside the GIL; tiny reads stay on the GIL because a
+handoff costs more than the lookup. An optional initial value capacity lets
+small reads write directly into the returned Python object; otherwise they use
+a stack buffer.
 
 `Cache.get_into()` writes into a caller-owned `bytearray` and avoids allocating
 `bytes` on the read path:

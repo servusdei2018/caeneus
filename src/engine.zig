@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const Shard = @import("shard.zig").Shard;
+pub const StatsSnapshot = @import("shard.zig").StatsSnapshot;
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -100,5 +101,20 @@ pub const Engine = struct {
         };
         // Cache miss.
         return null;
+    }
+
+    pub fn statsSnapshot(self: *const Engine) StatsSnapshot {
+        var result = StatsSnapshot{};
+        for (self.shards) |*shard| {
+            const stats = shard.statsSnapshot();
+            result.lookup_probes += stats.lookup_probes;
+            result.index_deletes += stats.index_deletes;
+            result.index_rebuilds += stats.index_rebuilds;
+            result.slab_reclaim_blocks += stats.slab_reclaim_blocks;
+            result.slab_wraps += stats.slab_wraps;
+            result.seqlock_retries += stats.seqlock_retries;
+            result.lock_fallbacks += stats.lock_fallbacks;
+        }
+        return result;
     }
 };

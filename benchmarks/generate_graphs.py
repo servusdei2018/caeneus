@@ -74,6 +74,8 @@ def run_go():
 
 def run_python():
     print("=== Running Python benchmarks ===")
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
     res = subprocess.run([
         "uv", "run", "--project", "ext/python", "python", "ext/python/benchmark.py",
         "--profile", "all",
@@ -81,13 +83,47 @@ def run_python():
         "--operations", "10000",
         "--keys", "2048",
         "--sample-rate", "100"
-    ], capture_output=True, text=True, check=True)
+    ], capture_output=True, text=True, env=env, check=True)
     
     results = []
     for line in res.stdout.splitlines():
         if line.strip().startswith("{"):
             data = json.loads(line)
             profile = "A" if "A_read_heavy" in data["profile"] else "B"
+            results.append({
+                "profile": profile,
+                "implementation": data["implementation"],
+                "throughput": data["operations_per_second"],
+                "p50_us": data["p50_us"],
+                "p99_us": data["p99_us"]
+            })
+    return results
+
+def run_python_mt():
+    print("=== Running Python MT benchmarks ===")
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
+    res = subprocess.run([
+        "uv", "run", "--project", "ext/python", "python", "ext/python/benchmark_multithread.py",
+        "--profile", "all",
+        "--implementation", "caeneus,plain_dict,lru_dict",
+        "--workers", "8",
+        "--mode", "shared",
+        "--api", "get",
+        "--operations-per-worker", "10000",
+        "--sample-rate", "100"
+    ], capture_output=True, text=True, env=env, check=True)
+    
+    results = []
+    for line in res.stdout.splitlines():
+        if line.strip().startswith("{"):
+            data = json.loads(line)
+            if data["profile"] == "read_distributed":
+                profile = "A"
+            elif data["profile"] == "mixed_hot":
+                profile = "B"
+            else:
+                continue
             results.append({
                 "profile": profile,
                 "implementation": data["implementation"],
@@ -301,7 +337,9 @@ def plot_comparison(lang, data, output_path):
 def build_project():
     print("Building native libraries...")
     subprocess.run(["zig", "build", "-Doptimize=ReleaseFast"], check=True)
-    subprocess.run(["uv", "sync", "--project", "ext/python", "--extra", "benchmarks"], check=True)
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
+    subprocess.run(["uv", "sync", "--project", "ext/python", "--extra", "benchmarks"], env=env, check=True)
     if not os.path.exists("ext/node/node_modules"):
         subprocess.run(["npm", "--prefix", "ext/node", "install"], check=True)
 
@@ -338,7 +376,7 @@ def push_to_benchmarks_branch(temp_img_dir):
             print("No changes in benchmark performance. Skipping upload.")
             return
             
-        subprocess.run(["git", "-C", temp_git_dir, "push", "origin", "benchmarks"], check=True)
+        subprocess.run(["git", "-C", temp_git_dir, "push", "origin", "benchmarks", "--force"], check=True)
         print("Successfully uploaded graphs to branch 'benchmarks'.")
 
 def main():
@@ -377,6 +415,13 @@ def main():
             plot_comparison("python", py_data, os.path.join(target_dir, "python_benchmark.png"))
         except Exception as e:
             print(f"Error running/plotting Python: {e}", file=sys.stderr)
+            
+        # Python Multithreaded (8 Workers)
+        try:
+            py_mt_data = run_python_mt()
+            plot_comparison("python (multithreaded - 8 workers)", py_mt_data, os.path.join(target_dir, "python_mt_benchmark.png"))
+        except Exception as e:
+            print(f"Error running/plotting Python MT: {e}", file=sys.stderr)
             
         # Node
         try:

@@ -14,6 +14,7 @@ PYTHON_BENCHMARK="$PYTHON_PROJECT/benchmark.py"
 PYTHON_CONTENTION="$PYTHON_PROJECT/benchmark_multithread.py"
 PYTHON_IMPLEMENTATIONS="caeneus,plain_dict,cachetools_lru,lru_dict"
 PYTHON_CACHE="$PYTHON_IMPLEMENTATIONS"
+PYTHON_WORKLOAD="${PYTHON_WORKLOAD:-write_then_read}"
 if [[ "$CAENEUS_ONLY" == true ]]; then
     PYTHON_CACHE=caeneus
 fi
@@ -29,12 +30,14 @@ if [[ "$BENCHMARK_MODE" == quick ]]; then
         --operations 10000 \
         --keys 2048 \
         --workers 1 \
-        --sample-rate 100
+        --sample-rate 100 \
+        --workload "$PYTHON_WORKLOAD"
 else
     uv run --project "$PYTHON_PROJECT" python "$PYTHON_BENCHMARK" \
         --profile all \
         --cache "$PYTHON_CACHE" \
-        --workers 1
+        --workers 1 \
+        --workload "$PYTHON_WORKLOAD"
 fi
 
 print_section "Python contention benchmark ($BENCHMARK_MODE)"

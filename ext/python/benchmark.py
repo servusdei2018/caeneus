@@ -123,9 +123,21 @@ def make_factory(
     raise ValueError(f"unknown cache implementation: {name}")
 
 
-def build_workload(profile: Profile, keys: list[str]) -> list[tuple[str, bool]]:
+@dataclass(frozen=True)
+class Workload:
+    """Workload with both operation order and pre-split tight-loop lists."""
+
+    operations: list[tuple[str, bool]]
+    reads: list[str]
+    writes: list[str]
+    total: int
+
+
+def build_workload(profile: Profile, keys: list[str]) -> Workload:
     rng = random.Random(42)
-    workload: list[tuple[str, bool]] = []
+    operations: list[tuple[str, bool]] = []
+    reads: list[str] = []
+    writes: list[str] = []
     write_ratio = 1.0 - profile.read_ratio
     write_index = 0
     for operation in range(profile.operations):
@@ -138,8 +150,17 @@ def build_workload(profile: Profile, keys: list[str]) -> list[tuple[str, bool]]:
         if profile.name.startswith("B") and not is_write:
             offset = rng.randrange(min(profile.keys, profile.capacity * 4))
             key_index = (write_index - offset) % profile.keys
-        workload.append((keys[key_index], is_write))
-    return workload
+        if is_write:
+            writes.append(keys[key_index])
+        else:
+            reads.append(keys[key_index])
+        operations.append((keys[key_index], is_write))
+    return Workload(
+        operations=operations,
+        reads=reads,
+        writes=writes,
+        total=profile.operations,
+    )
 
 
 def run_implementation(
@@ -147,9 +168,10 @@ def run_implementation(
     profile: Profile,
     keys: list[str],
     values: bytes,
-    workload: list[tuple[str, bool]],
+    workload: Workload,
     workers: int,
     sample_rate: int,
+    workload_mode: str,
 ) -> dict[str, object]:
     factory = make_factory(name, profile, len(values))
     caches = [factory() for _ in range(workers)]
@@ -169,25 +191,66 @@ def run_implementation(
 
         def worker(worker_index: int) -> tuple[list[int], int, int]:
             cache = caches[worker_index]
+            # Slice this worker's share of the pre-split read and write lists.
+            my_reads = workload.reads[worker_index::workers]
+            my_writes = workload.writes[worker_index::workers]
+            my_operations = workload.operations[worker_index::workers]
+
+            # --- Sample-interval timing setup ---
+            # Instead of checking operation % sample_rate every iteration,
+            # collect one timing sample per sample_rate reads (amortised).
+            sample_interval = max(1, sample_rate)
             samples: list[int] = []
+
             hits = 0
             misses = 0
-            for operation, (key, is_write) in enumerate(
-                workload[worker_index::workers]
-            ):
-                started = (
-                    time.perf_counter_ns()
-                    if operation % sample_rate == 0
-                    else 0
-                )
-                if is_write:
+            if workload_mode == "write_then_read":
+                # --- Write pass: tight loop, no branch, no None check ---
+                for key in my_writes:
                     cache.set(key, values)
-                elif cache.get(key) is None:
-                    misses += 1
-                else:
-                    hits += 1
-                if started:
-                    samples.append(time.perf_counter_ns() - started)
+
+                # --- Read pass: tight loop with batched sampling ---
+                i = 0
+                n_reads = len(my_reads)
+                while i < n_reads:
+                    # Unsample block: run sample_interval reads without timing
+                    end = min(i + sample_interval, n_reads)
+                    for key in my_reads[i:end]:
+                        v = cache.get(key)
+                        if v is None:
+                            misses += 1
+                        else:
+                            hits += 1
+                    i = end
+                    # Single timed sample at each interval boundary
+                    if i < n_reads:
+                        t0 = time.perf_counter_ns()
+                        v = cache.get(my_reads[i])
+                        samples.append(time.perf_counter_ns() - t0)
+                        if v is None:
+                            misses += 1
+                        else:
+                            hits += 1
+                        i += 1
+            else:
+                # Profile B's actual mixed workload: preserve generated order.
+                for i, (key, is_write) in enumerate(my_operations):
+                    t0 = (
+                        time.perf_counter_ns()
+                        if i % sample_interval == 0
+                        else 0
+                    )
+                    if is_write:
+                        cache.set(key, values)
+                    else:
+                        v = cache.get(key)
+                        if v is None:
+                            misses += 1
+                        else:
+                            hits += 1
+                    if t0:
+                        samples.append(time.perf_counter_ns() - t0)
+
             return samples, hits, misses
 
         started = time.perf_counter_ns()
@@ -209,13 +272,16 @@ def run_implementation(
     return {
         "implementation": name,
         "profile": profile.name,
-        "operations": len(workload),
+        "workload": workload_mode,
+        "operations": workload.total,
+        "read_operations": len(workload.reads),
+        "write_operations": len(workload.writes),
         "workers": workers,
         "value_bytes": len(values),
         "hits": hits,
         "misses": misses,
         "elapsed_ms": round(elapsed_ns / 1_000_000, 3),
-        "operations_per_second": round(len(workload) * 1_000_000_000 / elapsed_ns),
+        "operations_per_second": round(workload.total * 1_000_000_000 / elapsed_ns),
         "sample_count": len(samples),
         "p50_us": round(percentile(samples, 0.50), 3),
         "p99_us": round(percentile(samples, 0.99), 3),
@@ -236,6 +302,12 @@ def main() -> None:
     parser.add_argument("--value-size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--sample-rate", type=int, default=1_000)
+    parser.add_argument(
+        "--workload",
+        choices=("write_then_read", "interleaved", "both"),
+        default="write_then_read",
+        help="run the historical split workload, an interleaved workload, or both",
+    )
     args = parser.parse_args()
 
     if args.workers < 1 or args.sample_rate < 1:
@@ -258,21 +330,28 @@ def main() -> None:
         workload = build_workload(profile, keys)
         values = b"a" * args.value_size
 
-        for implementation in implementation_names:
-            try:
-                result = run_implementation(
-                    implementation,
-                    profile,
-                    keys,
-                    values,
-                    workload,
-                    args.workers,
-                    args.sample_rate,
-                )
-            except RuntimeError as error:
-                print(f"skipping {implementation}: {error}", file=sys.stderr)
-                continue
-            print(json.dumps(result, sort_keys=True))
+        workload_modes = (
+            ("write_then_read", "interleaved")
+            if args.workload == "both"
+            else (args.workload,)
+        )
+        for workload_mode in workload_modes:
+            for implementation in implementation_names:
+                try:
+                    result = run_implementation(
+                        implementation,
+                        profile,
+                        keys,
+                        values,
+                        workload,
+                        args.workers,
+                        args.sample_rate,
+                        workload_mode,
+                    )
+                except RuntimeError as error:
+                    print(f"skipping {implementation}: {error}", file=sys.stderr)
+                    continue
+                print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

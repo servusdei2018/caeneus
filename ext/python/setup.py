@@ -74,7 +74,7 @@ extension = Extension(
     library_dirs=library_dirs,
     libraries=libraries + system_libraries,
     extra_objects=extra_objects,
-    extra_compile_args=["/std:c11", "/experimental:c11atomics"] if platform.system() == "Windows" else ["-std=c11"],
+    extra_compile_args=["/std:c11", "/experimental:c11atomics"] if platform.system() == "Windows" else ["-std=c11", "-O3", "-march=native", "-fomit-frame-pointer"],
 )
 
 setup(

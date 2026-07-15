@@ -69,8 +69,6 @@ pub const BitField = struct {
         const word_idx = i >> 6;
         const bit_idx = i & 63;
         const mask = @as(u64, 1) << @intCast(bit_idx);
-        const word = @atomicLoad(u64, &self.words[word_idx], .monotonic);
-        if ((word & mask) == 0) return false;
         const old_word = @atomicRmw(u64, &self.words[word_idx], .And, ~mask, .monotonic);
         return (old_word & mask) != 0;
     }

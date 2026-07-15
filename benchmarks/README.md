@@ -17,6 +17,10 @@ The full Go suite runs each benchmark three times by default. Change that with
 `--count N`. Run one suite with `run-zig.sh`, `run-go.sh`, `run-python.sh`, or
 `run-node.sh`.
 
+The Python runner keeps the historical write-then-read Profile B workload by
+default. Set `PYTHON_WORKLOAD=interleaved` to measure the operation order
+described by the profile, or `PYTHON_WORKLOAD=both` to emit both result sets.
+
 `--quick` uses smaller workloads and runs only Caeneus for the bindings. It is
 for checking builds and integrations, not for publishing performance results.
 The full Go eviction profile uses a large key set and may need several minutes
@@ -64,4 +68,5 @@ The following graphs are generated on a WSL system with an AMD Ryzen 7900X 12-co
 ![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/zig_benchmark.png?raw=true)
 ![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/go_benchmark.png?raw=true)
 ![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/python_benchmark.png?raw=true)
+![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/python_mt_benchmark.png?raw=true)
 ![](https://github.com/servusdei2018/caeneus/blob/benchmarks/benchmarks/assets/node_benchmark.png?raw=true)

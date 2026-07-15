@@ -13,6 +13,7 @@ pub const BlockHeader = struct {
 pub const SlabPool = struct {
     buffer: []align(std.heap.page_size_min) u8,
     write_ptr: u32 align(std.atomic.cache_line) = 0,
+    reclaim_ptr: u32 = invalid_offset,
     shard: *Shard = undefined, // Set after shard initialization
 
     pub fn init(buffer: []align(std.heap.page_size_min) u8) SlabPool {
@@ -66,18 +67,11 @@ pub const SlabPool = struct {
             return error.ValueTooLarge;
         }
 
+        self.precleanTail(S);
+
         // Check if we need to wrap around to offset 0
-        if (self.write_ptr + needed_len > S) {
-            var scan_offset = self.write_ptr;
-            while (scan_offset < S) {
-                const header = self.readHeader(scan_offset);
-                if (header.slot_idx != invalid_slot_idx) {
-                    if (self.shard.isSlotActive(header.slot_idx, scan_offset)) {
-                        self.shard.evictSlot(header.slot_idx);
-                    }
-                }
-                scan_offset += header.block_len;
-            }
+        if (needed_len > S - self.write_ptr) {
+            self.finishTailReclaim(S);
             const wrap_len = S - self.write_ptr;
             self.writeHeader(self.write_ptr, .{
                 .slot_idx = invalid_slot_idx,
@@ -85,6 +79,7 @@ pub const SlabPool = struct {
                 .key_len = 0,
             });
             self.write_ptr = 0;
+            self.reclaim_ptr = invalid_offset;
         }
 
         const init_header = self.readHeader(self.write_ptr);
@@ -139,5 +134,44 @@ pub const SlabPool = struct {
         }
 
         return allocated_offset;
+    }
+
+    fn precleanTail(self: *SlabPool, S: u32) void {
+        const threshold = @min(S, @as(u32, 64 * 1024));
+        if (S - self.write_ptr > threshold) return;
+
+        if (self.reclaim_ptr == S or self.reclaim_ptr < self.write_ptr) {
+            self.reclaim_ptr = self.write_ptr;
+        }
+        if (self.reclaim_ptr >= S) return;
+
+        const budget_end = @min(S, self.reclaim_ptr + @as(u32, 4 * 1024));
+        self.reclaim_ptr = self.scanReclaimRange(self.reclaim_ptr, budget_end);
+    }
+
+    fn finishTailReclaim(self: *SlabPool, S: u32) void {
+        if (self.reclaim_ptr < S) {
+            const start = @max(self.reclaim_ptr, self.write_ptr);
+            _ = self.scanReclaimRange(start, S);
+        }
+        self.shard.evictPendingSlabBlocks();
+        self.shard.noteSlabWrap();
+    }
+
+    fn scanReclaimRange(self: *SlabPool, start: u32, end: u32) u32 {
+        const S = @as(u32, @intCast(self.buffer.len));
+        const header_size = @as(u32, @intCast(@sizeOf(BlockHeader)));
+        var offset = start;
+        while (offset < end and offset < S) {
+            const header = self.readHeader(offset);
+            if (header.block_len < header_size or header.block_len > S - offset) {
+                return S;
+            }
+            if (header.slot_idx != invalid_slot_idx) {
+                self.shard.markSlabBlockPending(header.slot_idx, offset);
+            }
+            offset += header.block_len;
+        }
+        return offset;
     }
 };

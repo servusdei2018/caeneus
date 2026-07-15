@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("common.zig");
 const TicketLock = common.TicketLock;
 const BitField = common.BitField;
@@ -6,6 +7,27 @@ const SlabPool = @import("slab.zig").SlabPool;
 const BlockHeader = @import("slab.zig").BlockHeader;
 const invalid_slot_idx = @import("slab.zig").invalid_slot_idx;
 const invalid_offset = @import("slab.zig").invalid_offset;
+const tombstone_slot_idx = invalid_slot_idx - 1;
+
+pub const StatsSnapshot = struct {
+    lookup_probes: u64 = 0,
+    index_deletes: u64 = 0,
+    index_rebuilds: u64 = 0,
+    slab_reclaim_blocks: u64 = 0,
+    slab_wraps: u64 = 0,
+    seqlock_retries: u64 = 0,
+    lock_fallbacks: u64 = 0,
+};
+
+const DebugStats = struct {
+    lookup_probes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    index_deletes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    index_rebuilds: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    slab_reclaim_blocks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    slab_wraps: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    seqlock_retries: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    lock_fallbacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
 
 pub const IndexEntry = extern struct {
     hash_low: u32 align(8),
@@ -35,8 +57,12 @@ pub const Shard = struct {
 
     index_mask: usize,
     table: []IndexEntry,
+    index_positions: []u32,
+    tombstones: u32,
+    stats: if (builtin.mode == .Debug) DebugStats else void,
 
     visited: BitField,
+    reclaim_offsets: []u32,
     hashes: []u64,
     metadata: []SlotMetadata,
 
@@ -58,7 +84,13 @@ pub const Shard = struct {
         const table = try allocator.alloc(IndexEntry, table_size);
         @memset(table, .{ .hash_low = 0, .slot_idx = invalid_slot_idx });
 
+        const index_positions = try allocator.alloc(u32, total_slots_aligned);
+        @memset(index_positions, invalid_slot_idx);
+
         const visited = try BitField.init(allocator, total_slots_aligned);
+
+        const reclaim_offsets = try allocator.alloc(u32, total_slots_aligned);
+        @memset(reclaim_offsets, invalid_offset);
 
         const hashes = try allocator.alloc(u64, total_slots_aligned);
         @memset(hashes, 0);
@@ -72,8 +104,8 @@ pub const Shard = struct {
             try allocator.allocWithOptions(u8, slab_size, std.mem.Alignment.fromByteUnits(std.heap.page_size_min), null);
         @memset(slab_buf, 0);
 
-        const builtin = @import("builtin");
-        if (builtin.os.tag == .linux) {
+        const builtin_info = @import("builtin");
+        if (builtin_info.os.tag == .linux) {
             std.posix.madvise(@alignCast(slab_buf.ptr), slab_buf.len, std.posix.MADV.HUGEPAGE) catch {};
         }
 
@@ -87,7 +119,11 @@ pub const Shard = struct {
             .total_slots = total_slots_aligned,
             .index_mask = index_mask,
             .table = table,
+            .index_positions = index_positions,
+            .tombstones = 0,
+            .stats = if (builtin.mode == .Debug) .{} else {},
             .visited = visited,
+            .reclaim_offsets = reclaim_offsets,
             .hashes = hashes,
             .metadata = metadata,
             .slab = SlabPool.init(slab_buf),
@@ -98,7 +134,9 @@ pub const Shard = struct {
 
     pub fn deinit(self: *Shard, allocator: std.mem.Allocator) void {
         allocator.free(self.table);
+        allocator.free(self.index_positions);
         allocator.free(self.visited.words);
+        allocator.free(self.reclaim_offsets);
         allocator.free(self.hashes);
         allocator.free(self.metadata);
         allocator.free(self.slab.buffer);
@@ -111,19 +149,69 @@ pub const Shard = struct {
         return metadata.offset == offset;
     }
 
+    pub fn statsSnapshot(self: *const Shard) StatsSnapshot {
+        if (comptime builtin.mode == .Debug) {
+            return .{
+                .lookup_probes = self.stats.lookup_probes.load(.monotonic),
+                .index_deletes = self.stats.index_deletes.load(.monotonic),
+                .index_rebuilds = self.stats.index_rebuilds.load(.monotonic),
+                .slab_reclaim_blocks = self.stats.slab_reclaim_blocks.load(.monotonic),
+                .slab_wraps = self.stats.slab_wraps.load(.monotonic),
+                .seqlock_retries = self.stats.seqlock_retries.load(.monotonic),
+                .lock_fallbacks = self.stats.lock_fallbacks.load(.monotonic),
+            };
+        }
+        return .{};
+    }
+
+    pub inline fn noteSlabReclaimBlock(self: *Shard) void {
+        if (comptime builtin.mode == .Debug) {
+            _ = self.stats.slab_reclaim_blocks.fetchAdd(1, .monotonic);
+        }
+    }
+
+    pub inline fn noteSlabWrap(self: *Shard) void {
+        if (comptime builtin.mode == .Debug) {
+            _ = self.stats.slab_wraps.fetchAdd(1, .monotonic);
+        }
+    }
+
+    pub fn markSlabBlockPending(self: *Shard, slot_idx: u32, offset: u32) void {
+        if (slot_idx >= self.total_slots) return;
+        if (self.isSlotActive(slot_idx, offset)) {
+            self.reclaim_offsets[slot_idx] = offset;
+            self.noteSlabReclaimBlock();
+        }
+    }
+
+    pub fn evictPendingSlabBlocks(self: *Shard) void {
+        var slot_idx: u32 = 0;
+        while (slot_idx < self.total_slots) : (slot_idx += 1) {
+            const offset = self.reclaim_offsets[slot_idx];
+            if (offset == invalid_offset) continue;
+            self.reclaim_offsets[slot_idx] = invalid_offset;
+            if (self.isSlotActive(slot_idx, offset)) {
+                self.evictSlot(slot_idx);
+            }
+        }
+    }
+
     pub fn evictSlot(self: *Shard, slot_idx: u32) void {
         std.debug.assert(slot_idx < self.total_slots);
         const meta_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.metadata[slot_idx])), .monotonic);
         const metadata = @as(SlotMetadata, @bitCast(meta_u64));
         if (metadata.offset == invalid_offset) return;
 
-        const hash = self.hashes[slot_idx];
-        self.deleteIndexMap(slot_idx, hash);
+        self.deleteIndexMap(slot_idx);
 
+        if (self.reclaim_offsets[slot_idx] == metadata.offset) {
+            self.reclaim_offsets[slot_idx] = invalid_offset;
+        }
         self.visited.unsetAtomic(slot_idx);
         const new_meta_u64 = @as(u64, @bitCast(SlotMetadata{ .offset = invalid_offset, .len = 0 }));
         @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.metadata[slot_idx])), new_meta_u64, .release);
         self.hashes[slot_idx] = 0;
+        self.maybeRebuildIndexMap();
     }
 
     pub fn get(self: *Shard, key: []const u8, hash: u64, buf: []u8, required_len: ?*usize) !?[]const u8 {
@@ -138,25 +226,28 @@ pub const Shard = struct {
 
             const slot_idx = self.lookup(key, hash);
             if (slot_idx == invalid_slot_idx) {
-                const seq2 = self.seq.load(.seq_cst);
+                const seq2 = self.seq.load(.acquire);
                 if (seq1 == seq2) return null;
+                self.noteSeqlockRetry();
                 continue;
             }
 
             const meta_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.metadata[slot_idx])), .acquire);
             const metadata = @as(SlotMetadata, @bitCast(meta_u64));
             if (metadata.len == 0 or metadata.offset >= self.slab.buffer.len) {
-                const seq2 = self.seq.load(.seq_cst);
+                const seq2 = self.seq.load(.acquire);
                 if (seq1 == seq2) return null;
+                self.noteSeqlockRetry();
                 continue;
             }
 
             if (buf.len < metadata.len) {
-                const seq2 = self.seq.load(.seq_cst);
+                const seq2 = self.seq.load(.acquire);
                 if (seq1 == seq2) {
                     if (required_len) |rl| rl.* = metadata.len;
                     return error.BufferTooSmall;
                 }
+                self.noteSeqlockRetry();
                 continue;
             }
 
@@ -168,8 +259,9 @@ pub const Shard = struct {
 
             const stored_key = self.slab.buffer[offset + @sizeOf(BlockHeader) ..][0..header.key_len];
             if (!std.mem.eql(u8, stored_key, key)) {
-                const seq2 = self.seq.load(.seq_cst);
+                const seq2 = self.seq.load(.acquire);
                 if (seq1 == seq2) return null; // hash collision
+                self.noteSeqlockRetry();
                 continue;
             }
 
@@ -178,14 +270,16 @@ pub const Shard = struct {
             @memcpy(buf[0..metadata.len], stored_val);
 
             asm volatile ("" ::: .{ .memory = true });
-            const seq2 = self.seq.load(.seq_cst);
+            const seq2 = self.seq.load(.acquire);
             if (seq1 == seq2) {
                 self.visited.setAtomic(slot_idx);
                 return buf[0..metadata.len];
             }
+            self.noteSeqlockRetry();
         }
 
         // --- Locking
+        self.noteLockFallback();
         self.lock.lock();
         defer self.lock.unlock();
 
@@ -217,7 +311,7 @@ pub const Shard = struct {
         // Increment sequence to odd (write starting)
         const seq1 = self.seq.load(.monotonic);
         self.seq.store(seq1 +% 1, .seq_cst);
-        defer self.seq.store(seq1 +% 2, .seq_cst);
+        defer self.seq.store(seq1 +% 2, .release);
 
         const existing_slot = self.lookup(key, hash);
         if (existing_slot != invalid_slot_idx) {
@@ -281,10 +375,15 @@ pub const Shard = struct {
         const hash_low = @as(u32, @intCast(hash & 0xFFFFFFFF));
         var idx = @as(usize, hash_low) & mask;
         while (true) {
+            self.noteLookupProbe();
             const entry_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.table[idx])), .monotonic);
             const entry = @as(IndexEntry, @bitCast(entry_u64));
             if (entry.slot_idx == invalid_slot_idx) {
                 return invalid_slot_idx;
+            }
+            if (entry.slot_idx == tombstone_slot_idx) {
+                idx = (idx + 1) & mask;
+                continue;
             }
             if (entry.hash_low == hash_low and self.keyEquals(entry.slot_idx, key)) {
                 return entry.slot_idx;
@@ -315,76 +414,84 @@ pub const Shard = struct {
         const mask = self.index_mask;
         const hash_low = @as(u32, @intCast(hash & 0xFFFFFFFF));
         var idx = @as(usize, hash_low) & mask;
+        var first_tombstone: ?usize = null;
         while (true) {
             const entry_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.table[idx])), .monotonic);
             const entry = @as(IndexEntry, @bitCast(entry_u64));
             if (entry.slot_idx == invalid_slot_idx) {
+                const insert_idx = first_tombstone orelse idx;
                 const new_entry_u64 = @as(u64, @bitCast(IndexEntry{ .hash_low = hash_low, .slot_idx = slot_idx }));
-                @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.table[idx])), new_entry_u64, .monotonic);
+                @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.table[insert_idx])), new_entry_u64, .monotonic);
+                self.index_positions[slot_idx] = @intCast(insert_idx);
+                if (first_tombstone != null) {
+                    self.tombstones -= 1;
+                }
                 return;
+            }
+            if (entry.slot_idx == tombstone_slot_idx and first_tombstone == null) {
+                first_tombstone = idx;
             }
             idx = (idx + 1) & mask;
         }
     }
 
     fn updateSlotInIndexMap(self: *Shard, hash: u64, old_slot_idx: u32, new_slot_idx: u32) void {
-        const mask = self.index_mask;
         const hash_low = @as(u32, @intCast(hash & 0xFFFFFFFF));
-        var idx = @as(usize, hash_low) & mask;
-        while (true) {
-            const entry_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.table[idx])), .monotonic);
-            const entry = @as(IndexEntry, @bitCast(entry_u64));
-            if (entry.slot_idx == old_slot_idx) {
-                const new_entry_u64 = @as(u64, @bitCast(IndexEntry{ .hash_low = hash_low, .slot_idx = new_slot_idx }));
-                @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.table[idx])), new_entry_u64, .monotonic);
-                return;
-            }
-            if (entry.slot_idx == invalid_slot_idx) {
-                std.debug.panic("slot index not found in index map", .{});
-            }
-            idx = (idx + 1) & mask;
+        const idx = self.index_positions[old_slot_idx];
+        if (idx == invalid_slot_idx) {
+            std.debug.panic("slot index not found in index map", .{});
         }
+        const entry_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.table[idx])), .monotonic);
+        const entry = @as(IndexEntry, @bitCast(entry_u64));
+        if (entry.slot_idx != old_slot_idx) {
+            std.debug.panic("slot index position is stale", .{});
+        }
+        const new_entry_u64 = @as(u64, @bitCast(IndexEntry{ .hash_low = hash_low, .slot_idx = new_slot_idx }));
+        @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.table[idx])), new_entry_u64, .monotonic);
+        self.index_positions[old_slot_idx] = invalid_slot_idx;
+        self.index_positions[new_slot_idx] = idx;
     }
 
-    fn deleteIndexMap(self: *Shard, slot_idx: u32, hash: u64) void {
-        const mask = self.index_mask;
-        const hash_low = @as(u32, @intCast(hash & 0xFFFFFFFF));
-        var idx = @as(usize, hash_low) & mask;
-        while (true) {
-            const entry_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.table[idx])), .monotonic);
-            const entry = @as(IndexEntry, @bitCast(entry_u64));
-            if (entry.slot_idx == slot_idx) {
-                var curr = idx;
-                var next = (curr + 1) & mask;
-                while (true) {
-                    const next_entry_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.table[next])), .monotonic);
-                    const next_entry = @as(IndexEntry, @bitCast(next_entry_u64));
-                    if (next_entry.slot_idx == invalid_slot_idx) {
-                        break;
-                    }
-                    const natural_idx = @as(usize, next_entry.hash_low) & mask;
-                    if (!isIndexBetween(curr, next, natural_idx)) {
-                        @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.table[curr])), next_entry_u64, .monotonic);
-                        curr = next;
-                    }
-                    next = (next + 1) & mask;
-                }
-                const empty_entry_u64 = @as(u64, @bitCast(IndexEntry{ .hash_low = 0, .slot_idx = invalid_slot_idx }));
-                @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.table[curr])), empty_entry_u64, .monotonic);
-                return;
-            }
-            if (entry.slot_idx == invalid_slot_idx) {
-                return;
-            }
-            idx = (idx + 1) & mask;
+    fn deleteIndexMap(self: *Shard, slot_idx: u32) void {
+        const idx = self.index_positions[slot_idx];
+        if (idx == invalid_slot_idx) {
+            return;
         }
+        const entry_u64 = @atomicLoad(u64, @as(*align(8) const u64, @ptrCast(&self.table[idx])), .monotonic);
+        const entry = @as(IndexEntry, @bitCast(entry_u64));
+        if (entry.slot_idx != slot_idx) {
+            std.debug.panic("slot index position is stale", .{});
+        }
+        const tombstone_u64 = @as(u64, @bitCast(IndexEntry{ .hash_low = 0, .slot_idx = tombstone_slot_idx }));
+        @atomicStore(u64, @as(*align(8) u64, @ptrCast(&self.table[idx])), tombstone_u64, .monotonic);
+        self.index_positions[slot_idx] = invalid_slot_idx;
+        self.tombstones += 1;
+        self.noteIndexDelete();
     }
 
-    fn isIndexBetween(curr: usize, next: usize, natural: usize) bool {
-        if (curr < next) {
-            return natural > curr and natural <= next;
-        } else {
-            return natural > curr or natural <= next;
+    fn maybeRebuildIndexMap(self: *Shard) void {
+        const threshold: u32 = @intCast(@max(@as(usize, 1), self.table.len / 8));
+        if (self.tombstones < threshold) return;
+
+        const empty_u64 = @as(u64, @bitCast(IndexEntry{ .hash_low = 0, .slot_idx = invalid_slot_idx }));
+        for (self.table) |*entry| {
+            @atomicStore(u64, @as(*align(8) u64, @ptrCast(entry)), empty_u64, .monotonic);
+        }
+        @memset(self.index_positions, invalid_slot_idx);
+        self.tombstones = 0;
+        self.noteIndexRebuild();
+
+        var slot_idx: u32 = 0;
+        while (slot_idx < self.total_slots) : (slot_idx += 1) {
+            const meta_u64 = @atomicLoad(
+                u64,
+                @as(*align(8) const u64, @ptrCast(&self.metadata[slot_idx])),
+                .monotonic,
+            );
+            const metadata = @as(SlotMetadata, @bitCast(meta_u64));
+            if (metadata.offset != invalid_offset) {
+                self.insertIndexMap(self.hashes[slot_idx], slot_idx);
+            }
         }
     }
 
@@ -405,6 +512,36 @@ pub const Shard = struct {
             } else {
                 return slot;
             }
+        }
+    }
+
+    inline fn noteLookupProbe(self: *Shard) void {
+        if (comptime builtin.mode == .Debug) {
+            _ = self.stats.lookup_probes.fetchAdd(1, .monotonic);
+        }
+    }
+
+    inline fn noteIndexDelete(self: *Shard) void {
+        if (comptime builtin.mode == .Debug) {
+            _ = self.stats.index_deletes.fetchAdd(1, .monotonic);
+        }
+    }
+
+    inline fn noteIndexRebuild(self: *Shard) void {
+        if (comptime builtin.mode == .Debug) {
+            _ = self.stats.index_rebuilds.fetchAdd(1, .monotonic);
+        }
+    }
+
+    inline fn noteSeqlockRetry(self: *Shard) void {
+        if (comptime builtin.mode == .Debug) {
+            _ = self.stats.seqlock_retries.fetchAdd(1, .monotonic);
+        }
+    }
+
+    inline fn noteLockFallback(self: *Shard) void {
+        if (comptime builtin.mode == .Debug) {
+            _ = self.stats.lock_fallbacks.fetchAdd(1, .monotonic);
         }
     }
 };

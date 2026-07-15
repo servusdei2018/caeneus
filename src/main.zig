@@ -135,6 +135,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("Latency (p99):       {d:.3} us\n", .{result.p99});
     std.debug.print("Latency (p99.9):     {d:.3} us\n", .{result.p999});
     std.debug.print("Latency (p99.99):    {d:.3} us\n", .{result.p9999});
+    std.debug.print(
+        "Debug counters: probes={} deletes={} rebuilds={} reclaim_blocks={} wraps={} retries={} lock_fallbacks={}\n",
+        .{
+            result.stats.lookup_probes,
+            result.stats.index_deletes,
+            result.stats.index_rebuilds,
+            result.stats.slab_reclaim_blocks,
+            result.stats.slab_wraps,
+            result.stats.seqlock_retries,
+            result.stats.lock_fallbacks,
+        },
+    );
     std.debug.print("==================================================\n", .{});
 }
 
@@ -145,6 +157,7 @@ const BenchResult = struct {
     p99: f64,
     p999: f64,
     p9999: f64,
+    stats: caeneus.StatsSnapshot,
 };
 
 fn runEngineBenchmark(
@@ -249,6 +262,7 @@ fn runEngineBenchmark(
         .p99 = p99,
         .p999 = p999,
         .p9999 = p9999,
+        .stats = engine.statsSnapshot(),
     };
 }
 
@@ -388,6 +402,36 @@ test "eviction correctness" {
     try std.testing.expect(got_item_2 == null);
 }
 
+test "index rebuild survives eviction churn" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, 1, 64, 64 * 1024);
+    defer engine.deinit();
+
+    var key_buf: [32]u8 = undefined;
+    var read_buf: [64]u8 = undefined;
+    const value = "value";
+
+    var i: usize = 0;
+    while (i < 4096) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "churn_{}", .{i});
+        try engine.set(key, value);
+        const got = try engine.get(key, &read_buf, null);
+        try std.testing.expect(got != null);
+        try std.testing.expectEqualSlices(u8, value, got.?);
+    }
+
+    i = 4032;
+    while (i < 4096) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "churn_{}", .{i});
+        const got = try engine.get(key, &read_buf, null);
+        try std.testing.expect(got != null);
+    }
+
+    if (comptime @import("builtin").mode == .Debug) {
+        try std.testing.expect(engine.statsSnapshot().index_rebuilds > 0);
+    }
+}
+
 test "concurrency safety under heavy contention" {
     const allocator = std.testing.allocator;
     var engine = try Engine.init(allocator, 16, 256, 64 * 1024);
@@ -404,6 +448,70 @@ test "concurrency safety under heavy contention" {
 
     for (threads) |t| {
         t.join();
+    }
+}
+
+test "distributed reads stay lock-free after sorted warmup" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, 32, 1024, 4 * 1024 * 1024);
+    defer engine.deinit();
+
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [128]u8 = undefined;
+    @memset(&value_buf, 'R');
+    var worker_index: usize = 0;
+    while (worker_index < 8) : (worker_index += 1) {
+        var key_index: usize = 0;
+        while (key_index < 128) : (key_index += 1) {
+            const key = try std.fmt.bufPrint(
+                &key_buf,
+                "worker:{}:key:{:0>6}",
+                .{ worker_index, key_index },
+            );
+            try engine.set(key, &value_buf);
+            var read_buf: [128]u8 = undefined;
+            const got = try engine.get(key, &read_buf, null);
+            try std.testing.expect(got != null);
+        }
+    }
+
+    var threads: [8]std.Thread = undefined;
+    var timer = try Timer.start();
+    worker_index = 0;
+    while (worker_index < threads.len) : (worker_index += 1) {
+        threads[worker_index] = try std.Thread.spawn(
+            .{},
+            distributedReadWorker,
+            .{ &engine, worker_index, 1000 },
+        );
+    }
+    for (threads) |thread| thread.join();
+    const elapsed = timer.read();
+
+    if (comptime @import("builtin").mode == .Debug) {
+        const stats = engine.statsSnapshot();
+        try std.testing.expectEqual(@as(u64, 0), stats.lock_fallbacks);
+        try std.testing.expectEqual(@as(u64, 0), stats.seqlock_retries);
+    }
+    std.debug.print("distributed read test: {d:.3} ms\n", .{
+        @as(f64, @floatFromInt(elapsed)) / 1_000_000.0,
+    });
+}
+
+fn distributedReadWorker(engine: *Engine, worker_index: usize, operations: usize) void {
+    var key_buf: [32]u8 = undefined;
+    var read_buf: [128]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(worker_index + 42);
+    const random = prng.random();
+    var i: usize = 0;
+    while (i < operations) : (i += 1) {
+        const key_index = random.uintLessThan(usize, 128);
+        const key = std.fmt.bufPrint(
+            &key_buf,
+            "worker:{}:key:{:0>6}",
+            .{ worker_index, key_index },
+        ) catch return;
+        _ = engine.get(key, &read_buf, null) catch return;
     }
 }
 
@@ -456,6 +564,10 @@ test "tail latency" {
     std.mem.sort(u64, latencies.items, {}, std.sort.asc(u64));
     const p99 = latencies.items[latencies.items.len * 99 / 100];
     try std.testing.expect(p99 < 500_000);
+    if (comptime @import("builtin").mode == .Debug) {
+        const stats = engine.statsSnapshot();
+        try std.testing.expect(stats.slab_wraps > 0);
+    }
 }
 
 test "zero post-initialization allocations" {
