@@ -44,7 +44,7 @@ require_command npm
 print_section "Building native ReleaseFast library"
 (
     cd "$REPO_ROOT"
-    zig build -Doptimize=ReleaseFast
+    zig build -Doptimize=ReleaseFast -Dcpu=native
 )
 
 "$SCRIPT_DIR/run-zig.sh" "--$BENCHMARK_MODE"

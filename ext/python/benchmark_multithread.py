@@ -119,18 +119,22 @@ def make_factory(
     keys_per_worker: int,
     value_size: int,
     initial_value_capacity: int,
+    gil_threshold: int | None = None,
 ) -> Callable[[], CacheAdapter]:
     capacity = max(1024, workers * keys_per_worker * 2)
     if implementation == "caeneus":
         num_shards = native_shard_count(workers)
 
         def create_native() -> CacheAdapter:
-            return caeneus.Cache(
-                num_shards=num_shards,
-                slots_per_shard=1024,
-                slab_size_per_shard=4 * 1024 * 1024,
-                initial_value_capacity=initial_value_capacity,
-            )
+            kwargs = {
+                "num_shards": num_shards,
+                "slots_per_shard": 1024,
+                "slab_size_per_shard": 4 * 1024 * 1024,
+                "initial_value_capacity": initial_value_capacity,
+            }
+            if gil_threshold is not None:
+                kwargs["gil_threshold"] = gil_threshold
+            return caeneus.Cache(**kwargs)
 
         return create_native
     if implementation == "plain_dict":
@@ -185,6 +189,7 @@ def run_one(
     value: bytes,
     sample_rate: int,
     initial_value_capacity: int,
+    gil_threshold: int | None = None,
 ) -> dict[str, object]:
     key_sets, workloads = build_workloads(
         profile,
@@ -198,6 +203,7 @@ def run_one(
         keys_per_worker,
         len(value),
         initial_value_capacity,
+        gil_threshold,
     )
     if mode == "shared":
         caches = [factory()]
@@ -347,6 +353,11 @@ def main() -> None:
         type=int,
         help="initial native get buffer size; defaults to --value-size, use 0 to force probing",
     )
+    parser.add_argument(
+        "--gil-threshold",
+        type=int,
+        help="value size threshold in bytes below which GIL is not released",
+    )
     args = parser.parse_args()
 
     if (
@@ -366,6 +377,8 @@ def main() -> None:
     )
     if initial_value_capacity < 0:
         parser.error("--initial-value-capacity cannot be negative")
+    if args.gil_threshold is not None and args.gil_threshold < 0:
+        parser.error("--gil-threshold cannot be negative")
 
     profiles = (
         tuple(PROFILES.values())
@@ -398,6 +411,7 @@ def main() -> None:
                                 value,
                                 args.sample_rate,
                                 initial_value_capacity,
+                                args.gil_threshold,
                             )
                         except RuntimeError as error:
                             print(f"skipping {implementation}: {error}")

@@ -59,7 +59,7 @@ jobs:
           CAENEUS_ROOT: ${{ github.workspace }}
         run: |
           uv venv "${RUNNER_TEMP}/caeneus-python-venv"
-          uv pip install --python "${RUNNER_TEMP}/caeneus-python-venv/bin/python" ext/python
+          CC=clang CXX=clang++ uv pip install --python "${RUNNER_TEMP}/caeneus-python-venv/bin/python" ext/python
           "${RUNNER_TEMP}/caeneus-python-venv/bin/python" ext/python/test_caeneus.py
 
       - name: Test install from outside the checkout
@@ -121,3 +121,40 @@ jobs:
           bun init -y
           bun add "$package_tarball"
           bun -e "const {Cache}=require('caeneus-native'); const c=new Cache(); c.set('ci','ok'); if (!c.get('ci').equals(Buffer.from('ok'))) process.exit(1); c.close()"
+
+  cross-build:
+    name: Cross-build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-latest
+            zig_target: x86_64-linux-gnu
+            static_lib: libcaeneus.a
+          - platform: linux_arm64
+            runner: ubuntu-latest
+            zig_target: aarch64-linux-gnu
+            static_lib: libcaeneus.a
+          - platform: darwin_arm64
+            runner: macos-latest
+            zig_target: aarch64-macos
+            static_lib: libcaeneus.a
+          - platform: windows_amd64
+            runner: ubuntu-latest
+            zig_target: x86_64-windows-gnu
+            static_lib: caeneus-static.lib
+          - platform: windows_amd64_msvc
+            runner: windows-2022
+            zig_target: x86_64-windows-msvc
+            static_lib: caeneus-static.lib
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build static library
+        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseFast -p zig-package

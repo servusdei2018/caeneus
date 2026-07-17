@@ -103,6 +103,55 @@ class CacheTests(unittest.TestCase):
         finally:
             cache.close()
 
+    def test_buffer_protocol_support(self) -> None:
+        cache = self.make_cache()
+        try:
+            # Test key/value as bytearray/memoryview in set/get
+            key_ba = bytearray(b"bytearray-key")
+            val_ba = bytearray(b"bytearray-value")
+            
+            cache.set(key_ba, val_ba)
+            self.assertEqual(cache.get(key_ba), b"bytearray-value")
+            
+            key_mv = memoryview(key_ba)
+            val_mv = memoryview(val_ba)
+            
+            cache.set(key_mv, val_mv)
+            self.assertEqual(cache.get(key_mv), b"bytearray-value")
+            
+            # Check get_into works with buffer protocol keys
+            output = bytearray(64)
+            length = cache.get_into(key_mv, output)
+            self.assertEqual(length, len(val_mv))
+            self.assertEqual(bytes(output[:length]), b"bytearray-value")
+            
+            # Test that invalid types still raise TypeError
+            with self.assertRaises(TypeError):
+                cache.set(123, b"value")
+            with self.assertRaises(TypeError):
+                cache.set(b"key", 123)
+            with self.assertRaises(TypeError):
+                cache.get(123)
+            with self.assertRaises(TypeError):
+                cache.get_into(123, output)
+        finally:
+            cache.close()
+
+    def test_numpy_array_support(self) -> None:
+        try:
+            import numpy as np
+        except ImportError:
+            return
+            
+        cache = self.make_cache()
+        try:
+            k = np.array([1, 2, 3], dtype=np.int64)
+            v = np.array([4, 5, 6], dtype=np.int64)
+            cache.set(k, v)
+            self.assertEqual(cache.get(k), v.tobytes())
+        finally:
+            cache.close()
+
     def test_concurrent_reads(self) -> None:
         cache = self.make_cache()
         try:
@@ -163,7 +212,7 @@ class CacheTests(unittest.TestCase):
 
         # Test invalid positional count
         with self.assertRaises(TypeError):
-            caeneus.Cache(16, 1024, 4096, 0, 999)
+            caeneus.Cache(16, 1024, 4096, 0, 999, 111)
 
         # Test invalid keyword argument
         with self.assertRaises(TypeError):
@@ -172,6 +221,14 @@ class CacheTests(unittest.TestCase):
         # Test negative integer value
         with self.assertRaises(ValueError):
             caeneus.Cache(num_shards=-1)
+
+        # Test negative gil_threshold
+        with self.assertRaises(ValueError):
+            caeneus.Cache(gil_threshold=-100)
+
+        # Test valid gil_threshold
+        c5 = caeneus.Cache(gil_threshold=2048)
+        c5.close()
 
 
 if __name__ == "__main__":

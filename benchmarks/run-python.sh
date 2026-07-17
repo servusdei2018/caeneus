@@ -20,7 +20,8 @@ if [[ "$CAENEUS_ONLY" == true ]]; then
 fi
 
 print_section "Preparing Python benchmark environment"
-uv sync --project "$PYTHON_PROJECT" --extra benchmarks
+rm -rf "$PYTHON_PROJECT/build/" "$PYTHON_PROJECT/dist/" "$PYTHON_PROJECT"/*.egg-info
+CC=clang CXX=clang++ uv sync --project "$PYTHON_PROJECT" --reinstall --no-cache --extra benchmarks
 
 print_section "Python comparison benchmark ($BENCHMARK_MODE)"
 if [[ "$BENCHMARK_MODE" == quick ]]; then

@@ -32,15 +32,12 @@ native_archive() {
 ensure_native_archive() {
     local archive
     archive="$(native_archive)"
-    if [[ -f "$archive" ]]; then
-        return
-    fi
 
     require_command zig
     print_section "Building native ReleaseFast library"
     (
         cd "$REPO_ROOT"
-        zig build -Doptimize=ReleaseFast
+        zig build -Doptimize=ReleaseFast -Dcpu=native
     )
     [[ -f "$archive" ]] || die "native archive was not produced: $archive"
 }

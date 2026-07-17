@@ -334,14 +334,18 @@ def plot_comparison(lang, data, output_path):
     plt.savefig(output_path, dpi=150)
     plt.close()
 
-def build_project():
+def build_project(lang=None):
     print("Building native libraries...")
     subprocess.run(["zig", "build", "-Doptimize=ReleaseFast"], check=True)
-    env = os.environ.copy()
-    env.pop("VIRTUAL_ENV", None)
-    subprocess.run(["uv", "sync", "--project", "ext/python", "--extra", "benchmarks"], env=env, check=True)
-    if not os.path.exists("ext/node/node_modules"):
-        subprocess.run(["npm", "--prefix", "ext/node", "install"], check=True)
+    
+    if lang is None or lang in ("python", "python_mt"):
+        env = os.environ.copy()
+        env.pop("VIRTUAL_ENV", None)
+        subprocess.run(["uv", "sync", "--project", "ext/python", "--extra", "benchmarks"], env=env, check=True)
+        
+    if lang is None or lang == "node":
+        if not os.path.exists("ext/node/node_modules"):
+            subprocess.run(["npm", "--prefix", "ext/node", "install"], check=True)
 
 def push_to_benchmarks_branch(temp_img_dir):
     print("=== Uploading graphs to 'benchmarks' branch ===")
@@ -382,9 +386,11 @@ def push_to_benchmarks_branch(temp_img_dir):
 def main():
     parser = argparse.ArgumentParser(description="Run benchmarks and generate comparative graphs.")
     parser.add_argument("--dry-run", action="store_true", help="Generate graphs locally in 'benchmarks/assets/' without uploading them.")
+    parser.add_argument("--lang", choices=["zig", "go", "python", "python_mt", "node"], default=None,
+                        help="Only run benchmarks and generate graphs for a specific language or plan.")
     args = parser.parse_args()
 
-    build_project()
+    build_project(args.lang)
     
     if args.dry_run:
         target_dir = "benchmarks/assets"
@@ -396,39 +402,44 @@ def main():
 
     try:
         # Zig
-        try:
-            zig_data = run_zig()
-            plot_zig(zig_data, os.path.join(target_dir, "zig_benchmark.png"))
-        except Exception as e:
-            print(f"Error running/plotting Zig: {e}", file=sys.stderr)
+        if args.lang is None or args.lang == "zig":
+            try:
+                zig_data = run_zig()
+                plot_zig(zig_data, os.path.join(target_dir, "zig_benchmark.png"))
+            except Exception as e:
+                print(f"Error running/plotting Zig: {e}", file=sys.stderr)
             
         # Go
-        try:
-            go_data = run_go()
-            plot_comparison("go", go_data, os.path.join(target_dir, "go_benchmark.png"))
-        except Exception as e:
-            print(f"Error running/plotting Go: {e}", file=sys.stderr)
+        if args.lang is None or args.lang == "go":
+            try:
+                go_data = run_go()
+                plot_comparison("go", go_data, os.path.join(target_dir, "go_benchmark.png"))
+            except Exception as e:
+                print(f"Error running/plotting Go: {e}", file=sys.stderr)
             
         # Python
-        try:
-            py_data = run_python()
-            plot_comparison("python", py_data, os.path.join(target_dir, "python_benchmark.png"))
-        except Exception as e:
-            print(f"Error running/plotting Python: {e}", file=sys.stderr)
+        if args.lang is None or args.lang == "python":
+            try:
+                py_data = run_python()
+                plot_comparison("python", py_data, os.path.join(target_dir, "python_benchmark.png"))
+            except Exception as e:
+                print(f"Error running/plotting Python: {e}", file=sys.stderr)
             
         # Python Multithreaded (8 Workers)
-        try:
-            py_mt_data = run_python_mt()
-            plot_comparison("python (multithreaded - 8 workers)", py_mt_data, os.path.join(target_dir, "python_mt_benchmark.png"))
-        except Exception as e:
-            print(f"Error running/plotting Python MT: {e}", file=sys.stderr)
+        if args.lang is None or args.lang == "python_mt":
+            try:
+                py_mt_data = run_python_mt()
+                plot_comparison("python (multithreaded - 8 workers)", py_mt_data, os.path.join(target_dir, "python_mt_benchmark.png"))
+            except Exception as e:
+                print(f"Error running/plotting Python MT: {e}", file=sys.stderr)
             
         # Node
-        try:
-            node_data = run_node()
-            plot_comparison("node", node_data, os.path.join(target_dir, "node_benchmark.png"))
-        except Exception as e:
-            print(f"Error running/plotting Node: {e}", file=sys.stderr)
+        if args.lang is None or args.lang == "node":
+            try:
+                node_data = run_node()
+                plot_comparison("node", node_data, os.path.join(target_dir, "node_benchmark.png"))
+            except Exception as e:
+                print(f"Error running/plotting Node: {e}", file=sys.stderr)
             
         if not args.dry_run:
             push_to_benchmarks_branch(target_dir)

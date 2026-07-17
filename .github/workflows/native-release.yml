@@ -158,8 +158,9 @@ jobs:
           CIBW_ARCHS: ${{ matrix.cibw_arch }}
           CIBW_MANYLINUX_X86_64: manylinux_2_28
           CIBW_MANYLINUX_AARCH64: manylinux_2_28
+          CIBW_BEFORE_ALL_LINUX: yum install -y clang
           CIBW_BEFORE_BUILD: python {package}/build_native.py --version ${{ github.ref_name }} --dest ${{ matrix.stage_dir }}
-          CIBW_ENVIRONMENT: CAENEUS_NATIVE_STAGE=${{ matrix.stage_dir }} GITHUB_REPOSITORY=${{ github.repository }}
+          CIBW_ENVIRONMENT: CC=clang CXX=clang++ CAENEUS_NATIVE_STAGE=${{ matrix.stage_dir }} GITHUB_REPOSITORY=${{ github.repository }}
           CIBW_TEST_COMMAND: python {package}/test_caeneus.py
         run: python -m cibuildwheel --output-dir wheelhouse ext/python
 
