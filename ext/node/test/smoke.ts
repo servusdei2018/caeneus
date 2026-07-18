@@ -87,3 +87,15 @@ test("cache close is idempotent and rejects later operations", () => {
   assert.throws(() => cache.get("closed"), /closed/);
 });
 
+test("selects the runtime-specific native boundary", () => {
+  const cache = new Cache();
+  try {
+    assert.equal(
+      cache.usesV8FastApi,
+      typeof process.versions.bun !== "string",
+    );
+  } finally {
+    cache.close();
+  }
+});
+

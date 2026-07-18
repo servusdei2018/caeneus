@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
 import { LRUCache } from "lru-cache";
@@ -18,22 +20,28 @@ interface Options {
   profile: "A" | "B" | "all";
   cache: string;
   api: "get" | "get_into";
+  keyType: "string" | "buffer";
+  operation: "mixed" | "get" | "set";
   operations?: number;
   keys?: number;
   valueSize: number;
   workers: number;
   sampleRate: number;
+  repeats: number;
+  warmupOperations: number;
 }
 
+type BenchmarkKey = string | Buffer;
+
 interface WorkItem {
-  key: string;
+  key: BenchmarkKey;
   write: boolean;
 }
 
 interface CacheAdapter {
-  set(key: string, value: Buffer): void;
-  get(key: string): Buffer | null | undefined;
-  getInto?(key: string, output: Buffer): number | null;
+  set(key: BenchmarkKey, value: Buffer): void;
+  get(key: BenchmarkKey): Buffer | null | undefined;
+  getInto?(key: BenchmarkKey, output: Buffer): number | null;
   close(): void;
 }
 
@@ -57,13 +65,13 @@ const profiles: Record<"A" | "B", Profile> = {
 };
 
 class MapAdapter implements CacheAdapter {
-  private readonly cache = new Map<string, Buffer>();
+  private readonly cache = new Map<BenchmarkKey, Buffer>();
 
-  public set(key: string, value: Buffer): void {
+  public set(key: BenchmarkKey, value: Buffer): void {
     this.cache.set(key, value);
   }
 
-  public get(key: string): Buffer | undefined {
+  public get(key: BenchmarkKey): Buffer | undefined {
     return this.cache.get(key);
   }
 
@@ -73,17 +81,17 @@ class MapAdapter implements CacheAdapter {
 }
 
 class LruCacheAdapter implements CacheAdapter {
-  private readonly cache: LRUCache<string, Buffer>;
+  private readonly cache: LRUCache<BenchmarkKey, Buffer>;
 
   public constructor(capacity: number) {
     this.cache = new LRUCache({ max: capacity });
   }
 
-  public set(key: string, value: Buffer): void {
+  public set(key: BenchmarkKey, value: Buffer): void {
     this.cache.set(key, value);
   }
 
-  public get(key: string): Buffer | undefined {
+  public get(key: BenchmarkKey): Buffer | undefined {
     return this.cache.get(key);
   }
 
@@ -99,18 +107,22 @@ class NodeCacheAdapter implements CacheAdapter {
     useClones: false,
   });
 
-  public set(key: string, value: Buffer): void {
-    this.cache.set(key, value);
+  public set(key: BenchmarkKey, value: Buffer): void {
+    this.cache.set(benchmarkKeyString(key), value);
   }
 
-  public get(key: string): Buffer | undefined {
-    return this.cache.get<Buffer>(key);
+  public get(key: BenchmarkKey): Buffer | undefined {
+    return this.cache.get<Buffer>(benchmarkKeyString(key));
   }
 
   public close(): void {
     this.cache.flushAll();
     this.cache.close();
   }
+}
+
+function benchmarkKeyString(key: BenchmarkKey): string {
+  return typeof key === "string" ? key : key.toString("latin1");
 }
 
 function parseOptions(): Options {
@@ -137,6 +149,14 @@ function parseOptions(): Options {
   if (profile !== "A" && profile !== "B" && profile !== "all") {
     throw new Error("--profile must be A, B, or all");
   }
+  const keyType = values.get("--key-type") ?? "string";
+  if (keyType !== "string" && keyType !== "buffer") {
+    throw new Error("--key-type must be string or buffer");
+  }
+  const operation = values.get("--operation") ?? "mixed";
+  if (operation !== "mixed" && operation !== "get" && operation !== "set") {
+    throw new Error("--operation must be mixed, get, or set");
+  }
   return {
     profile,
     cache: values.get("--cache") ?? "all",
@@ -147,6 +167,8 @@ function parseOptions(): Options {
       }
       return api;
     })(),
+    keyType,
+    operation,
     operations: values.has("--operations")
       ? Number(values.get("--operations"))
       : undefined,
@@ -154,6 +176,8 @@ function parseOptions(): Options {
     valueSize: Number(values.get("--value-size") ?? 128),
     workers: Number(values.get("--workers") ?? 1),
     sampleRate: Number(values.get("--sample-rate") ?? 1_000),
+    repeats: Number(values.get("--repeats") ?? 1),
+    warmupOperations: Number(values.get("--warmup-operations") ?? 0),
   };
 }
 
@@ -202,12 +226,25 @@ function nextRandom(state: { value: number }): number {
   return ((result ^ (result >>> 14)) >>> 0) / 4_294_967_296;
 }
 
-function buildWorkload(profile: Profile, keys: string[]): WorkItem[] {
+function buildWorkload(
+  profile: Profile,
+  keys: BenchmarkKey[],
+  operation: Options["operation"],
+): WorkItem[] {
   const state = { value: 42 };
   const workload: WorkItem[] = [];
   let writeIndex = 0;
-  for (let operation = 0; operation < profile.operations; operation += 1) {
-    const write = nextRandom(state) >= profile.readRatio;
+  for (
+    let operationIndex = 0;
+    operationIndex < profile.operations;
+    operationIndex += 1
+  ) {
+    const write =
+      operation === "set"
+        ? true
+        : operation === "get"
+          ? false
+          : nextRandom(state) >= profile.readRatio;
     let keyIndex: number;
     if (profile.skewPower > 0) {
       keyIndex = Math.floor(
@@ -234,12 +271,19 @@ function runSingle(
   sampleRate: number,
   api: Options["api"],
   workers: number,
+  keyType: Options["keyType"],
+  operation: Options["operation"],
+  warmupOperations: number,
 ): Record<string, string | number> {
-  const keys = Array.from(
+  const keyStrings = Array.from(
     { length: profile.keys },
     (_, index) => `key:${index.toString().padStart(8, "0")}`,
   );
-  const workload = buildWorkload(profile, keys);
+  const keys: BenchmarkKey[] =
+    keyType === "buffer"
+      ? keyStrings.map((key) => Buffer.from(key))
+      : keyStrings;
+  const workload = buildWorkload(profile, keys, operation);
   const value = Buffer.alloc(valueSize, 0x61);
   const output = Buffer.alloc(valueSize);
   const cache = createAdapter(implementation, profile, workers);
@@ -249,10 +293,30 @@ function runSingle(
     }
 
     const large = Buffer.alloc(128 * 1024, 0x62);
-    cache.set("__large__", large);
-    const largeResult = cache.get("__large__");
+    const largeKey: BenchmarkKey =
+      keyType === "buffer" ? Buffer.from("__large__") : "__large__";
+    cache.set(largeKey, large);
+    const largeResult = cache.get(largeKey);
     if (largeResult == null || largeResult.length !== large.length) {
       throw new Error(`${implementation}: large-value verification failed`);
+    }
+
+    for (
+      let operationIndex = 0;
+      operationIndex < Math.min(warmupOperations, workload.length);
+      operationIndex += 1
+    ) {
+      const item = workload[operationIndex];
+      if (item.write) {
+        cache.set(item.key, value);
+      } else if (api === "get_into") {
+        if (cache.getInto === undefined) {
+          throw new Error(`${implementation}: get_into is not supported`);
+        }
+        cache.getInto(item.key, output);
+      } else {
+        cache.get(item.key);
+      }
     }
 
     const samples: number[] = [];
@@ -290,10 +354,13 @@ function runSingle(
     return {
       implementation,
       api,
+      key_type: keyType,
+      operation,
       profile: profile.name,
       operations: workload.length,
       workers: 1,
       value_bytes: valueSize,
+      warmup_operations: Math.min(warmupOperations, workload.length),
       hits,
       misses,
       elapsed_ms: Number(elapsedMs.toFixed(3)),
@@ -323,6 +390,9 @@ async function runFromWorker(): Promise<void> {
     sampleRate: number;
     api: Options["api"];
     workers: number;
+    keyType: Options["keyType"];
+    operation: Options["operation"];
+    warmupOperations: number;
   };
   parentPort?.postMessage(
     runSingle(
@@ -332,14 +402,51 @@ async function runFromWorker(): Promise<void> {
       request.sampleRate,
       request.api,
       request.workers,
+      request.keyType,
+      request.operation,
+      request.warmupOperations,
     ),
   );
 }
 
+function benchmarkMetadata(): Record<string, string> {
+  let revision = process.env.CAENEUS_GIT_REVISION ?? "unknown";
+  if (revision === "unknown") {
+    try {
+      revision = execFileSync(
+        "git",
+        ["-C", path.resolve(__dirname, "..", ".."), "rev-parse", "--short", "HEAD"],
+        { encoding: "utf8" },
+      ).trim();
+    } catch {
+      // Packaged consumers may not have a Git checkout.
+    }
+  }
+  return {
+    node_version: process.version,
+    v8_version: process.versions.v8,
+    platform: process.platform,
+    arch: process.arch,
+    bun_version: process.versions.bun ?? "none",
+    native_boundary:
+      process.versions.bun === undefined ? "node-v8-fast-api" : "bun-node-api",
+    native_build: process.env.CAENEUS_NATIVE_BUILD ?? "unknown",
+    git_revision: revision,
+  };
+}
+
 async function runFromMain(): Promise<void> {
   const options = parseOptions();
-  if (options.workers < 1 || options.sampleRate < 1) {
-    throw new Error("--workers and --sample-rate must be positive");
+  if (
+    options.workers < 1 ||
+    options.sampleRate < 1 ||
+    options.repeats < 1 ||
+    options.warmupOperations < 0
+  ) {
+    throw new Error(
+      "--workers, --sample-rate, and --repeats must be positive; " +
+        "--warmup-operations cannot be negative",
+    );
   }
   const profileNames: Array<"A" | "B"> =
     options.profile === "all" ? ["A", "B"] : [options.profile];
@@ -351,79 +458,92 @@ async function runFromMain(): Promise<void> {
   for (const profileName of profileNames) {
     const profile = withOverrides(profiles[profileName], options);
     for (const implementation of implementations) {
-      const started = performance.now();
-      let results: Array<Record<string, string | number>>;
-      if (options.workers === 1) {
-        results = [
-          runSingle(
+      for (let repeat = 1; repeat <= options.repeats; repeat += 1) {
+        const started = performance.now();
+        let results: Array<Record<string, string | number>>;
+        if (options.workers === 1) {
+          results = [
+            runSingle(
+              implementation,
+              profile,
+              options.valueSize,
+              options.sampleRate,
+              options.api,
+              options.workers,
+              options.keyType,
+              options.operation,
+              options.warmupOperations,
+            ),
+          ];
+        } else {
+          results = await Promise.all(
+            Array.from({ length: options.workers }, () =>
+              new Promise<Record<string, string | number>>((resolve, reject) => {
+                const worker = new Worker(__filename, {
+                  workerData: {
+                    implementation,
+                    profile,
+                    valueSize: options.valueSize,
+                    sampleRate: options.sampleRate,
+                    api: options.api,
+                    workers: options.workers,
+                    keyType: options.keyType,
+                    operation: options.operation,
+                    warmupOperations: options.warmupOperations,
+                  },
+                });
+                worker.once("message", resolve);
+                worker.once("error", reject);
+              }),
+            ),
+          );
+        }
+        const elapsedMs =
+          options.workers === 1
+            ? Number(results[0].elapsed_ms)
+            : performance.now() - started;
+        const operations = results.reduce(
+          (sum, result) => sum + Number(result.operations),
+          0,
+        );
+        const hits = results.reduce((sum, result) => sum + Number(result.hits), 0);
+        const misses = results.reduce(
+          (sum, result) => sum + Number(result.misses),
+          0,
+        );
+        console.log(
+          JSON.stringify({
+            ...benchmarkMetadata(),
+            repeat,
             implementation,
-            profile,
-            options.valueSize,
-            options.sampleRate,
-            options.api,
-            options.workers,
-          ),
-        ];
-      } else {
-        results = await Promise.all(
-          Array.from({ length: options.workers }, () =>
-            new Promise<Record<string, string | number>>((resolve, reject) => {
-              const worker = new Worker(__filename, {
-                workerData: {
-                  implementation,
-                  profile,
-                  valueSize: options.valueSize,
-                  sampleRate: options.sampleRate,
-                  api: options.api,
-                  workers: options.workers,
-                },
-              });
-              worker.once("message", resolve);
-              worker.once("error", reject);
-            }),
-          ),
+            api: options.api,
+            key_type: options.keyType,
+            operation: options.operation,
+            profile: profile.name,
+            operations,
+            workers: options.workers,
+            value_bytes: options.valueSize,
+            warmup_operations: options.warmupOperations,
+            hits,
+            misses,
+            elapsed_ms: Number(elapsedMs.toFixed(3)),
+            operations_per_second: Math.round((operations / elapsedMs) * 1_000),
+            worker_elapsed_ms: Number(
+              results
+                .reduce((sum, result) => sum + Number(result.elapsed_ms), 0)
+                .toFixed(3),
+            ),
+            p50_us: Number(
+              (results.reduce((sum, result) => sum + Number(result.p50_us), 0) /
+                results.length).toFixed(3),
+            ),
+            p99_us: Number(
+              (results.reduce((sum, result) => sum + Number(result.p99_us), 0) /
+                results.length).toFixed(3),
+            ),
+          }),
         );
       }
-      const elapsedMs =
-        options.workers === 1
-          ? Number(results[0].elapsed_ms)
-          : performance.now() - started;
-      const operations = results.reduce(
-        (sum, result) => sum + Number(result.operations),
-        0,
-      );
-      const hits = results.reduce((sum, result) => sum + Number(result.hits), 0);
-      const misses = results.reduce(
-        (sum, result) => sum + Number(result.misses),
-        0,
-      );
-      console.log(
-        JSON.stringify({
-          implementation,
-          api: options.api,
-          profile: profile.name,
-          operations,
-          workers: options.workers,
-          value_bytes: options.valueSize,
-          hits,
-          misses,
-          elapsed_ms: Number(elapsedMs.toFixed(3)),
-          operations_per_second: Math.round((operations / elapsedMs) * 1_000),
-          worker_elapsed_ms: Number(
-            results
-              .reduce((sum, result) => sum + Number(result.elapsed_ms), 0)
-              .toFixed(3),
-          ),
-          p50_us: Number(
-            (results.reduce((sum, result) => sum + Number(result.p50_us), 0) /
-              results.length).toFixed(3),
-          ),
-          p99_us: Number(
-            (results.reduce((sum, result) => sum + Number(result.p99_us), 0) /
-              results.length).toFixed(3),
-          ),
-        }),
-      );
     }
   }
 }

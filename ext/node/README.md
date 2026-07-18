@@ -1,7 +1,7 @@
 # Caeneus Node.js binding
 
-This binding is a compiled Node-API addon that links the Caeneus C ABI
-directly.
+This package provides a V8 Fast API addon for Node and a Bun-compatible addon
+that link the Caeneus C ABI directly.
 
 On supported platforms, install the package from npm or Bun:
 
@@ -11,8 +11,10 @@ npm install caeneus-native
 bun add caeneus-native
 ```
 
-The package includes a statically linked N-API prebuild, so normal installs do
+The package includes statically linked native prebuilds, so normal installs do
 not require a Caeneus checkout, Zig, or a C++ compiler.
+Node 22 and newer use the V8 Fast API addon, with prebuilds selected for the
+Node module version.
 
 For contributor source builds, build the native archive from the repository
 root, install the Node build tools, then run:
@@ -25,6 +27,8 @@ npm test
 ```
 
 `binding.gyp` links `zig-out/lib/libcaeneus.a` by default for a checkout build.
+`npm run build:native` builds the Node Fast API addon. Build the Bun addon with
+`npm run build:native:bun`.
 Override the repository and native library locations with:
 
 ```bash
@@ -48,9 +52,8 @@ with an external native archive, set `CAENEUS_BUILD_FROM_SOURCE=1`,
 `CAENEUS_ROOT`, `CAENEUS_INCLUDE_DIR`, and `CAENEUS_LIBRARY_DIR` before
 installing.
 
-The regular addon is portable across supported Node versions. The optional
-`npm run build:native:fast` target enables the experimental V8 Fast API path.
-It is tied to the Node/V8 version and is not required by the TypeScript API.
+The Node addon is tied to the Node/V8 module version. The package selects a
+matching Node prebuild at runtime. Bun uses its separate Node-API prebuild.
 
 `Cache.get()` returns a `Buffer` view over reusable native scratch storage.
 Consume the view before the next `get()` call — a later read may overwrite the

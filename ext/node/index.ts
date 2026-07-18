@@ -5,7 +5,7 @@ import * as path from "node:path";
 /** Key type accepted by Cache methods. */
 export type CacheKey = string | Buffer;
 
-interface NativeBinding {
+interface BunNativeBinding {
   createCache(
     numShards?: number,
     slotsPerShard?: number,
@@ -16,14 +16,40 @@ interface NativeBinding {
   get(cache: unknown, key: CacheKey): Buffer | null;
   getInto(cache: unknown, key: CacheKey, output: Buffer): number | null;
   scratch(cache: unknown): Buffer;
-  fastApiAvailable(): boolean;
 }
+
+interface FastCacheBinding {
+  set(key: CacheKey, value: string | Buffer): number | undefined;
+  setSlow(key: CacheKey, value: string | Buffer): void;
+  get(key: CacheKey): number;
+  getSlow(key: CacheKey): number;
+  getInto(key: CacheKey, output: Buffer): number | null;
+  getIntoSlow(key: CacheKey, output: Buffer): number | null;
+  scratch(): Buffer;
+  close(): void;
+}
+
+interface FastNativeBinding {
+  createCache(
+    numShards?: number,
+    slotsPerShard?: number,
+    slabSizePerShard?: number,
+  ): FastCacheBinding;
+}
+
+const runningOnBun = typeof process.versions.bun === "string";
 
 function nativeBindingPath(): string {
   // Prefer the locally-compiled addon so that a source checkout always runs
   // the freshest build.  In a published npm install the local build does not
   // exist, so we fall through to the prebuilt.
-  const local = path.join(__dirname, "..", "build", "Release", "caeneus.node");
+  const local = path.join(
+    __dirname,
+    "..",
+    "build",
+    "Release",
+    runningOnBun ? "caeneus_bun.node" : "caeneus.node",
+  );
   if (existsSync(local)) {
     return local;
   }
@@ -32,7 +58,9 @@ function nativeBindingPath(): string {
     __dirname,
     "..",
     "prebuilds",
-    `${process.platform}-${process.arch}`,
+    runningOnBun
+      ? `bun-${process.platform}-${process.arch}`
+      : `node-${process.versions.modules}-${process.platform}-${process.arch}`,
     "caeneus.node",
   );
   if (existsSync(prebuilt)) {
@@ -46,10 +74,14 @@ function nativeBindingPath(): string {
   );
 }
 
-// The compiled JavaScript lives in dist/, so this path resolves to either the
-// packaged N-API prebuild or the local node-gyp output.
+// The compiled JavaScript lives in dist/, so this path resolves to the
+// runtime-specific prebuild or the local node-gyp output.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const native = require(nativeBindingPath()) as NativeBinding;
+const native = require(nativeBindingPath()) as
+  | BunNativeBinding
+  | FastNativeBinding;
+const bunNative = native as BunNativeBinding;
+const fastNative = native as FastNativeBinding;
 
 /**
  * CacheOptions configures a new Cache.
@@ -74,6 +106,9 @@ export interface CacheOptions {
  */
 export class Cache {
   private readonly handle: unknown;
+  private readonly scratchBuffer: Buffer | undefined;
+  private scratchView: Buffer | undefined;
+  private scratchLength = -1;
   private closed = false;
 
   /**
@@ -86,11 +121,21 @@ export class Cache {
     const numShards = options.numShards ?? 64;
     const slotsPerShard = options.slotsPerShard ?? 1024;
     const slabSizePerShard = options.slabSizePerShard ?? 1024 * 1024;
-    this.handle = native.createCache(
-      numShards,
-      slotsPerShard,
-      slabSizePerShard,
-    );
+    if (runningOnBun) {
+      this.handle = bunNative.createCache(
+        numShards,
+        slotsPerShard,
+        slabSizePerShard,
+      );
+    } else {
+      const fastHandle = fastNative.createCache(
+        numShards,
+        slotsPerShard,
+        slabSizePerShard,
+      );
+      this.handle = fastHandle;
+      this.scratchBuffer = fastHandle.scratch();
+    }
   }
 
   /**
@@ -101,7 +146,19 @@ export class Cache {
    */
   public set(key: CacheKey, value: string | Buffer): void {
     this.assertOpen();
-    native.set(this.handle, key, value);
+    if (runningOnBun) {
+      bunNative.set(this.handle, key, value);
+      return;
+    }
+    const fastHandle = this.handle as FastCacheBinding;
+    const status = fastHandle.set(key, value);
+    if (status === -2) {
+      fastHandle.setSlow(key, value);
+      return;
+    }
+    if (status !== undefined && status !== 0) {
+      throw new Error("caeneus set failed");
+    }
   }
 
   /**
@@ -118,7 +175,25 @@ export class Cache {
    */
   public get(key: CacheKey): Buffer | null {
     this.assertOpen();
-    return native.get(this.handle, key);
+    if (runningOnBun) {
+      return bunNative.get(this.handle, key);
+    }
+    const fastHandle = this.handle as FastCacheBinding;
+    let length = fastHandle.get(key);
+    if (length === -2) {
+      length = fastHandle.getSlow(key);
+    }
+    if (length < 0) {
+      return null;
+    }
+    if (this.scratchBuffer === undefined) {
+      throw new Error("caeneus scratch buffer is unavailable");
+    }
+    if (this.scratchView === undefined || this.scratchLength !== length) {
+      this.scratchView = this.scratchBuffer.subarray(0, length);
+      this.scratchLength = length;
+    }
+    return this.scratchView;
   }
 
   /**
@@ -129,7 +204,15 @@ export class Cache {
    */
   public getInto(key: CacheKey, output: Buffer): number | null {
     this.assertOpen();
-    return native.getInto(this.handle, key, output);
+    if (runningOnBun) {
+      return bunNative.getInto(this.handle, key, output);
+    }
+    const fastHandle = this.handle as FastCacheBinding;
+    let length = fastHandle.getInto(key, output);
+    if (length === -2) {
+      length = fastHandle.getIntoSlow(key, output);
+    }
+    return length === -1 ? null : length;
   }
 
   /**
@@ -142,13 +225,17 @@ export class Cache {
     if (this.closed) {
       return;
     }
-    native.closeCache(this.handle);
+    if (runningOnBun) {
+      bunNative.closeCache(this.handle);
+    } else {
+      (this.handle as FastCacheBinding).close();
+    }
     this.closed = true;
   }
 
-  /** usesV8FastApi reports whether the experimental V8 Fast API is available. */
+  /** usesV8FastApi reports whether this runtime uses the V8 Fast API addon. */
   public get usesV8FastApi(): boolean {
-    return native.fastApiAvailable();
+    return !runningOnBun;
   }
 
   private assertOpen(): void {

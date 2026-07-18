@@ -98,6 +98,7 @@ jobs:
           npm install
           npm test
           npm run build:prebuild -- linux-x64
+          npm run build:prebuild:bun -- linux-x64
 
       - name: Test the packed npm package with npm
         working-directory: ext/node

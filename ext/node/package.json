@@ -14,6 +14,8 @@
     "dist/",
     "prebuilds/",
     "binding.cpp",
+    "binding_fast.cpp",
+    "v8-fast-api-calls.h",
     "binding.gyp",
     "scripts/",
     "README.md"
@@ -37,14 +39,15 @@
     "url": "https://github.com/servusdei2018/caeneus/issues"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "scripts": {
     "install": "node scripts/install.js",
     "build:native": "node-gyp rebuild",
-    "build:native:fast": "node-gyp rebuild --caeneus_fast_api=1 --caeneus_target_name=caeneus_fast",
+    "build:native:bun": "node-gyp rebuild --caeneus_target_name=caeneus_bun",
     "build:js": "tsc",
     "build:prebuild": "node scripts/build-prebuild.js",
+    "build:prebuild:bun": "node scripts/build-prebuild.js --bun",
     "build": "npm run build:native && tsc",
     "test": "npm run build && node --test dist/test/smoke.js",
     "benchmark": "npm run build && node dist/benchmark.js"

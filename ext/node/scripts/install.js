@@ -5,18 +5,23 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const packageRoot = path.resolve(__dirname, "..");
+const runningOnBun = typeof process.versions.bun === "string";
+const targetPrefix = runningOnBun
+  ? "bun-"
+  : `node-${process.versions.modules}-`;
+const addonName = runningOnBun ? "caeneus_bun" : "caeneus";
 
 function prebuiltPath() {
   return path.join(
     packageRoot,
     "prebuilds",
-    `${process.platform}-${process.arch}`,
+    `${targetPrefix}${process.platform}-${process.arch}`,
     "caeneus.node",
   );
 }
 
 function localAddonPath() {
-  return path.join(packageRoot, "build", "Release", "caeneus.node");
+  return path.join(packageRoot, "build", "Release", `${addonName}.node`);
 }
 
 function nativeLibraryName() {
@@ -32,6 +37,7 @@ function sourceBuildArguments() {
     process.env.CAENEUS_LIBRARY_DIR || path.join(root, "zig-out", "lib");
   return [
     "rebuild",
+    ...(runningOnBun ? ["--caeneus_target_name=caeneus_bun"] : []),
     `--caeneus_root=${root}`,
     `--caeneus_include_dir=${includeDir}`,
     `--caeneus_lib_dir=${libraryDir}`,

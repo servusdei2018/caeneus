@@ -188,7 +188,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   node-prebuilds:
-    name: Build Node prebuild (${{ matrix.platform }})
+    name: Build Node prebuild (${{ matrix.platform }}, Node ${{ matrix.node_version }})
     needs: release
     runs-on: ${{ matrix.runner }}
     env:
@@ -199,19 +199,35 @@ jobs:
         include:
           - platform: linux-x64
             runner: ubuntu-latest
+            node_version: "22"
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
+            node_version: "22"
           - platform: darwin-arm64
             runner: macos-14
+            node_version: "22"
           - platform: win32-x64
             runner: windows-2022
+            node_version: "22"
+          - platform: linux-x64
+            runner: ubuntu-latest
+            node_version: "24"
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            node_version: "24"
+          - platform: darwin-arm64
+            runner: macos-14
+            node_version: "24"
+          - platform: win32-x64
+            runner: windows-2022
+            node_version: "24"
 
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          node-version: ${{ matrix.node_version }}
 
       - uses: actions/setup-python@v6
         with:
@@ -231,13 +247,18 @@ jobs:
         working-directory: ext/node
         run: npm install
 
-      - name: Build the N-API prebuild
+      - name: Build Node prebuild
         working-directory: ext/node
         run: npm run build:prebuild -- "${{ matrix.platform }}"
 
+      - name: Build Bun prebuild
+        if: matrix.node_version == '22'
+        working-directory: ext/node
+        run: npm run build:prebuild:bun -- "${{ matrix.platform }}"
+
       - uses: actions/upload-artifact@v7
         with:
-          name: node-prebuild-${{ matrix.platform }}
+          name: node-prebuild-${{ matrix.platform }}-${{ matrix.node_version }}
           path: ext/node/prebuilds
 
   package-node:
