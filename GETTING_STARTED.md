@@ -15,8 +15,8 @@ The Go client uses cgo. From `ext/go`:
 
 ```bash
 cd ext/go
-go get github.com/servusdei2018/caeneus@v0.1.0
-eval "$(go run github.com/servusdei2018/caeneus/cmd/caeneus-native@v0.1.0 --version v0.1.0)"
+go get github.com/servusdei2018/caeneus@v0.1.3
+eval "$(go run github.com/servusdei2018/caeneus/cmd/caeneus-native@v0.1.3 --version v0.1.3)"
 go test ./...
 ```
 
